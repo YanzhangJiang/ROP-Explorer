@@ -190,7 +190,7 @@ async function startBackend() {
   });
 
   backendProcess.once('error', (error) => {
-    dialog.showErrorBox('ROP Explorer backend error', error.stack || String(error));
+    dialog.showErrorBox('ROP-Explorer backend error', error.stack || String(error));
     app.quit();
   });
 
@@ -203,7 +203,7 @@ async function startBackend() {
 
     const details = [stdoutBuffer.trim(), stderrBuffer.trim()].filter(Boolean).join('\n\n');
     dialog.showErrorBox(
-      'ROP Explorer backend exited unexpectedly',
+      'ROP-Explorer backend exited unexpectedly',
       details || `Backend exited with code ${code ?? 'unknown'}${signal ? ` (signal: ${signal})` : ''}.`,
     );
     app.quit();
@@ -236,7 +236,7 @@ app.whenReady().then(async () => {
     await startBackend();
     await createMainWindow();
   } catch (error) {
-    dialog.showErrorBox('Failed to start ROP Explorer', error.stack || String(error));
+    dialog.showErrorBox('Failed to start ROP-Explorer', error.stack || String(error));
     app.quit();
   }
 });

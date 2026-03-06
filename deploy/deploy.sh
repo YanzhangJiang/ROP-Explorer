@@ -4,10 +4,10 @@
  # @Date: 2026-03-04 05:04:49
  # @LastEditors: Yanzhang resicojyz@gmail.com
  # @LastEditTime: 2026-03-05 16:43:40
- # @FilePath: /ROP_Explorer/deploy/deploy.sh
+ # @FilePath: /ROP-Explorer/deploy/deploy.sh
  # @Description: 这是默认设置,请设置`customMade`, 打开koroFileHeader查看配置 进行设置: https://github.com/OBKoro1/koro1FileHeader/wiki/%E9%85%8D%E7%BD%AE
 ### 
-# ROP_Explorer EC2 Deployment Script
+# ROP-Explorer EC2 Deployment Script
 # Tested on: Ubuntu 22.04+ (x86_64)
 
 set -euo pipefail
@@ -15,10 +15,10 @@ set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 export NEEDRESTART_MODE=a
 
-REPO_URL="https://github.com/YanzhangJiang/ROP_Explorer.git"
-INSTALL_DIR="/opt/rop_explorer"
+REPO_URL="https://github.com/YanzhangJiang/ROP-Explorer.git"
+INSTALL_DIR="/opt/ROP-Explorer"
 
-echo "=== ROP_Explorer Deployment ==="
+echo "=== ROP-Explorer Deployment ==="
 
 # 1. Update system
 echo "[1/4] Updating system packages..."

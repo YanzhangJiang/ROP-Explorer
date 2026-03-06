@@ -1,4 +1,4 @@
-// ROP Explorer — Frontend Application
+// ROP-Explorer — Frontend Application
 const API = '';  // same origin
 
 // ─── State ───

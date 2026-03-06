@@ -1,6 +1,6 @@
-# ROP Explorer
+# ROP-Explorer
 
-ROP Explorer is an interactive tool for **Reaction Order Polyhedra (ROP)** analysis of equilibrium binding networks. It provides a browser UI for constructing binding networks, enumerating structural regimes, visualizing regime graphs, and exploring SISO paths and polyhedral geometry.
+ROP-Explorer is an interactive tool for **Reaction Order Polyhedra (ROP)** analysis of equilibrium binding networks. It provides a browser UI for constructing binding networks, enumerating structural regimes, visualizing regime graphs, and exploring SISO paths and polyhedral geometry.
 
 ![Demo](webapp/demo2.gif)
 
@@ -25,6 +25,13 @@ ROP-Explorer/
 - Docker + Docker Compose for server deployment
 
 ## Local Development
+
+Clone the repository:
+
+```bash
+git clone https://github.com/YanzhangJiang/ROP-Explorer.git
+cd ROP-Explorer
+```
 
 Install Julia dependencies from the repository root:
 
@@ -121,7 +128,7 @@ npm run build:mac-app
 The generated app is placed under:
 
 ```text
-desktop/release/mac-arm64/ROP Explorer.app
+desktop/release/mac-arm64/ROP-Explorer.app
 ```
 
 The current Electron packaging script is configured for macOS Apple Silicon (`arm64`).
@@ -130,7 +137,7 @@ The current Electron packaging script is configured for macOS Apple Silicon (`ar
 
 For GitHub Releases, upload only end-user deliverables:
 
-- `desktop/release/mac-arm64/ROP Explorer.app` as a zipped macOS desktop release
+- `desktop/release/mac-arm64/ROP-Explorer.app` as a zipped macOS desktop release
 - `dist/ROPExplorerBackend/` as a `.tar.gz` or `.zip` only if you want to publish a backend-only bundle
 
 Do not commit generated build directories such as `desktop/node_modules/`, `desktop/release/`, `desktop/release-packager/`, or `dist/` into the source repository. Build locally, then archive the final `.app` or `ROPExplorerBackend` bundle and upload that archive as the release asset.
@@ -140,7 +147,7 @@ Do not commit generated build directories such as `desktop/node_modules/`, `desk
 ### Desktop app release
 
 1. Download the packaged macOS release archive.
-2. Unzip it to get `ROP Explorer.app`.
+2. Unzip it to get `ROP-Explorer.app`.
 3. Launch the app. It starts its local backend automatically and opens the UI.
 
 ### Backend-only release

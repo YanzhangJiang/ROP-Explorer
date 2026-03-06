@@ -1,4 +1,4 @@
-// ROP Explorer — Node Edition Frontend (v3 — Dynamic Canvas)
+// ROP-Explorer — Node Edition Frontend (v3 — Dynamic Canvas)
 const API = '';
 
 // ===== State =====
