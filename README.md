@@ -133,14 +133,6 @@ desktop/release/mac-arm64/ROP-Explorer.app
 
 The current Electron packaging script is configured for macOS Apple Silicon (`arm64`).
 
-## What To Upload In Releases
-
-For GitHub Releases, upload only end-user deliverables:
-
-- `desktop/release/mac-arm64/ROP-Explorer.app` as a zipped macOS desktop release
-- `dist/ROPExplorerBackend/` as a `.tar.gz` or `.zip` only if you want to publish a backend-only bundle
-
-Do not commit generated build directories such as `desktop/node_modules/`, `desktop/release/`, `desktop/release-packager/`, or `dist/` into the source repository. Build locally, then archive the final `.app` or `ROPExplorerBackend` bundle and upload that archive as the release asset.
 
 ## How To Use A Published Release
 
