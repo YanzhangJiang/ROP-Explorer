@@ -1,0 +1,45 @@
+{
+  "name": "rop-explorer-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Minimal macOS desktop shell for ROP Explorer",
+  "author": "柳染/Yanzhang Jiang",
+  "productName": "ROP Explorer",
+  "main": "main.js",
+  "scripts": {
+    "dev": "electron .",
+    "build-backend": "julia --project=../packaging ../packaging/build_backend_app.jl",
+    "pack:mac-app-unsigned": "electron-packager . 'ROP Explorer' --platform=darwin --arch=arm64 --out=release-packager --overwrite --app-bundle-id=com.ropexplorer.desktop --extra-resource=../dist/ROPExplorerBackend",
+    "pack:mac-app": "CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dir --arm64",
+    "build:mac-app": "npm run build-backend && npm run pack:mac-app"
+  },
+  "devDependencies": {
+    "electron": "^40.8.0",
+    "electron-builder": "^26.8.1",
+    "electron-packager": "^17.1.2"
+  },
+  "build": {
+    "appId": "com.ropexplorer.desktop",
+    "productName": "ROP Explorer",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "main.js",
+      "package.json"
+    ],
+    "asar": true,
+    "mac": {
+      "category": "public.app-category.education",
+      "target": [
+        "dir"
+      ]
+    },
+    "extraResources": [
+      {
+        "from": "../dist/ROPExplorerBackend",
+        "to": "backend"
+      }
+    ]
+  }
+}

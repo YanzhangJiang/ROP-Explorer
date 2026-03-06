@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ROP Explorer - Node Edition</title>
+<script src="vendor/plotly-2.27.0.min.js"></script>
+<script>
+if (!window.Plotly) {
+  document.write('<script src="https://cdn.plot.ly/plotly-2.27.0.min.js"><\\/script>');
+}
+</script>
+<link rel="stylesheet" href="style-node.css">
+</head>
+<body>
+
+<div id="header">
+  <h1>ROP Explorer <span class="subtitle">Node Edition</span></h1>
+  <div class="header-right">
+    <div id="toolbar">
+      <button class="toolbar-btn" id="add-node-btn">Add Node</button>
+      <div class="dropdown-menu" id="add-node-menu">
+        <div class="menu-section-title">Input</div>
+        <div class="menu-item" data-type="reaction-network">
+          <span class="menu-color color-input"></span> Reaction Network
+        </div>
+        <div class="menu-section-title">Parameters</div>
+        <div class="menu-item" data-type="siso-params">
+          <span class="menu-color color-parameter"></span> SISO Config
+        </div>
+        <div class="menu-item" data-type="scan-1d-params">
+          <span class="menu-color color-parameter"></span> Scan 1D Config
+        </div>
+        <div class="menu-item" data-type="scan-2d-params">
+          <span class="menu-color color-parameter"></span> Scan 2D Config
+        </div>
+        <div class="menu-item" data-type="rop-cloud-params">
+          <span class="menu-color color-parameter"></span> ROP Cloud Config
+        </div>
+        <div class="menu-item" data-type="fret-params">
+          <span class="menu-color color-parameter"></span> FRET Config
+        </div>
+        <div class="menu-item" data-type="rop-poly-params">
+          <span class="menu-color color-parameter"></span> ROP Polyhedron Config
+        </div>
+        <div class="menu-section-title">Results</div>
+        <div class="menu-item" data-type="model-summary">
+          <span class="menu-color color-result"></span> Model Summary
+        </div>
+        <div class="menu-item" data-type="vertices-table">
+          <span class="menu-color color-result"></span> Vertices Table
+        </div>
+        <div class="menu-item" data-type="regime-graph">
+          <span class="menu-color color-result"></span> Regime Graph
+        </div>
+        <div class="menu-item" data-type="siso-result">
+          <span class="menu-color color-result"></span> SISO Result
+        </div>
+        <div class="menu-item" data-type="scan-1d-result">
+          <span class="menu-color color-result"></span> 1D Scan Result
+        </div>
+        <div class="menu-item" data-type="scan-2d-result">
+          <span class="menu-color color-result"></span> 2D Scan Result
+        </div>
+        <div class="menu-item" data-type="rop-cloud-result">
+          <span class="menu-color color-result"></span> ROP Cloud Result
+        </div>
+        <div class="menu-item" data-type="fret-result">
+          <span class="menu-color color-result"></span> FRET Result
+        </div>
+        <div class="menu-item" data-type="rop-poly-result">
+          <span class="menu-color color-result"></span> ROP Polyhedron Result
+        </div>
+      </div>
+      <button class="toolbar-btn" id="legacy-nodes-btn">Quick Add</button>
+      <div class="dropdown-menu" id="legacy-nodes-menu">
+        <div class="menu-section-title">WORK FLOW</div>
+        <div class="menu-item" data-type="siso-analysis">
+          <span class="menu-color color-viewer"></span> SISO Analysis
+        </div>
+        <div class="menu-item" data-type="rop-cloud">
+          <span class="menu-color color-viewer"></span> ROP Point Cloud
+        </div>
+        <div class="menu-item" data-type="fret-heatmap">
+          <span class="menu-color color-viewer"></span> FRET Heatmap
+        </div>
+        <div class="menu-item" data-type="parameter-scan-1d">
+          <span class="menu-color color-viewer"></span> Parameter Scan (1D)
+        </div>
+        <div class="menu-item" data-type="parameter-scan-2d">
+          <span class="menu-color color-viewer"></span> Parameter Scan (2D)
+        </div>
+        <div class="menu-item" data-type="rop-polyhedron">
+          <span class="menu-color color-viewer"></span> ROP Polyhedron
+        </div>
+      </div>
+    </div>
+    <button class="btn-icon" onclick="saveState()" title="Save Workspace">&#x1F4BE;</button>
+    <button class="btn-icon" onclick="loadState()" title="Load Workspace">&#x1F4C2;</button>
+    <button class="btn-icon" onclick="resetView()" title="Reset View">&#x27F2;</button>
+    <span id="status-badge" class="badge">Ready</span>
+  </div>
+</div>
+
+<div id="editor">
+  <div id="canvas">
+    <svg id="svg-layer"></svg>
+  </div>
+</div>
+
+<div id="toast-container"></div>
+
+<script src="app-node.js"></script>
+</body>
+</html>

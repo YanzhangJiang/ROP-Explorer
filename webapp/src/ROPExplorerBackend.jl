@@ -1,0 +1,1026 @@
+module ROPExplorerBackend
+
+export main, julia_main, router
+
+using HTTP
+using JSON3
+using LinearAlgebra
+using BindingAndCatalysis
+using Polyhedra
+using CDDLib
+using Graphs
+using SparseArrays
+using Random
+
+# ─── Global state ───
+const MODELS = Dict{String, Any}()  # session_id => Dict with model + computed data
+const STATIC_DIR = Ref{Union{Nothing, String}}(nothing)
+const SESSION_TTL = 3600  # 1 hour in seconds
+const SESSION_CLEANUP_INTERVAL = 300  # 5 minutes
+
+function resolve_static_dir()
+    candidates = String[]
+
+    env_static_dir = strip(get(ENV, "ROP_PUBLIC_DIR", ""))
+    if !isempty(env_static_dir)
+        push!(candidates, abspath(expanduser(env_static_dir)))
+    end
+
+    program_file = try
+        Base.PROGRAM_FILE
+    catch
+        ""
+    end
+
+    if !isempty(program_file)
+        exe_dir = dirname(abspath(program_file))
+        append!(candidates, [
+            normpath(joinpath(exe_dir, "..", "share", "rop-explorer", "public")),
+            normpath(joinpath(exe_dir, "..", "Resources", "public")),
+            normpath(joinpath(exe_dir, "..", "resources", "public")),
+        ])
+    end
+
+    push!(candidates, normpath(joinpath(@__DIR__, "..", "public")))
+
+    for candidate in unique(candidates)
+        isdir(candidate) && return candidate
+    end
+
+    error("Could not locate web assets. Checked: $(join(unique(candidates), ", "))")
+end
+
+function static_dir()
+    if STATIC_DIR[] === nothing
+        STATIC_DIR[] = resolve_static_dir()
+    end
+    return STATIC_DIR[]::String
+end
+
+resolve_port() = parse(Int, get(ENV, "ROP_PORT", "8088"))
+
+# Session cleanup task
+function cleanup_old_sessions()
+    while true
+        sleep(SESSION_CLEANUP_INTERVAL)
+        current_time = time()
+        to_delete = String[]
+        for (sid, sess) in MODELS
+            last_access = get(sess, "last_access", 0.0)
+            if current_time - last_access > SESSION_TTL
+                push!(to_delete, sid)
+            end
+        end
+        for sid in to_delete
+            delete!(MODELS, sid)
+            @info "Cleaned up expired session: $sid"
+        end
+    end
+end
+
+# ─── Reaction parser (same logic as notebooks) ───
+const ARROW_RE = r"<->|<=>|↔"
+
+function parse_term(term::AbstractString)
+    t = strip(term)
+    isempty(t) && error("Empty term")
+    m = match(r"^([0-9]+)?\s*([A-Za-z][A-Za-z0-9_]*)$", t)
+    m === nothing && error("Bad term: $term")
+    coeff = m.captures[1] === nothing ? 1 : parse(Int, m.captures[1])
+    sym = Symbol(m.captures[2])
+    return sym, coeff
+end
+
+function parse_side(side::AbstractString)
+    parts = split(side, "+")
+    dict = Dict{Symbol,Int}()
+    for p in parts
+        sym, coeff = parse_term(p)
+        dict[sym] = get(dict, sym, 0) + coeff
+    end
+    return dict
+end
+
+function parse_reactions(rules::Vector{String})
+    reactants = Vector{Dict{Symbol,Int}}()
+    products  = Vector{Dict{Symbol,Int}}()
+    for rule in rules
+        m = match(ARROW_RE, rule)
+        m === nothing && error("Reaction must contain '<->' or '<=>' or '↔': $rule")
+        left, right = split(rule, m.match)
+        push!(reactants, parse_side(left))
+        push!(products, parse_side(right))
+    end
+    return reactants, products
+end
+
+function parse_network_structure(rules::Vector{String})
+    reactants, products = parse_reactions(rules)
+    r = length(rules)
+
+    all_species = Set{Symbol}()
+    for rd in reactants
+        union!(all_species, keys(rd))
+    end
+    for pd in products
+        union!(all_species, keys(pd))
+    end
+
+    # Species that appear on product side are treated as bound species.
+    prod_species_set = Set{Symbol}()
+    for pd in products
+        union!(prod_species_set, keys(pd))
+    end
+    free_syms = sort([s for s in all_species if s ∉ prod_species_set])
+    prod_syms = sort([s for s in prod_species_set])
+
+    # free species first, then bound species
+    species = vcat(free_syms, prod_syms)
+    n = length(species)
+    idx = Dict(s => i for (i, s) in enumerate(species))
+
+    # N matrix (r × n), each row follows reactants-products log-space sign convention
+    N = zeros(Int, r, n)
+    for i in 1:r
+        for (s, coeff) in reactants[i]
+            N[i, idx[s]] += coeff
+        end
+        for (s, coeff) in products[i]
+            N[i, idx[s]] -= coeff
+        end
+    end
+
+    return N, species, free_syms, prod_syms
+end
+
+function build_model(rules::Vector{String}, kd::Vector{Float64})
+    r = length(rules)
+    length(kd) == r || error("Length(kd) must match number of reactions")
+
+    N, species, free_syms, prod_syms = parse_network_structure(rules)
+
+    x_sym = Symbol.(species)
+    q_sym = Symbol.("t" .* String.(free_syms))
+    K_sym = Symbol.("Kd" .* string.(1:r))
+
+    # 让 Bnc 构造函数验证合法性（n == d + r, N 线性无关等）
+    model = Bnc(N=N, x_sym=x_sym, q_sym=q_sym, K_sym=K_sym)
+    return model, species, free_syms, prod_syms
+end
+
+# ─── JSON helpers ───
+# Convert Matrix to Vector of Vectors for proper JSON serialization
+mat2vv(M::AbstractMatrix) = [collect(M[i,:]) for i in 1:size(M,1)]
+
+json_response(data; status=200) = HTTP.Response(status,
+    ["Content-Type" => "application/json", "Access-Control-Allow-Origin" => "*"],
+    JSON3.write(data))
+
+error_response(msg; status=400) = json_response(Dict("error" => msg); status)
+
+function read_json(req)
+    try
+        return JSON3.read(String(req.body))
+    catch e
+        error("Invalid JSON: $e")
+    end
+end
+
+# ─── Vertex data extractor ───
+function vertex_to_dict(model, idx)
+    perm = get_perm(model, idx)
+    nullity = get_nullity(model, idx)
+    asymp = is_asymptotic(model, idx)
+    singular = is_singular(model, idx)
+
+    # Get species names for the permutation
+    species_names = [string(model.x_sym[i]) for i in perm]
+
+    result = Dict(
+        "idx" => idx,
+        "perm" => collect(perm),
+        "species" => species_names,
+        "nullity" => nullity,
+        "asymptotic" => asymp,
+        "singular" => singular,
+        "x_sym" => string.(model.x_sym),
+        "q_sym" => string.(model.q_sym),
+        "K_sym" => string.(model.K_sym),
+    )
+
+    # Add H matrix for invertible vertices
+    if nullity == 0
+        H = get_H(model, idx)
+        result["H"] = mat2vv(Matrix(H))
+    end
+
+    return result
+end
+
+# ─── Graph data extractor ───
+function graph_to_dict(model)
+    vg = model.vertices_graph
+    vg === nothing && error("Graph not built yet")
+
+    nodes = []
+    for i in 1:n_vertices(model)
+        push!(nodes, Dict(
+            "id" => i,
+            "perm" => collect(get_perm(model, i)),
+            "asymptotic" => is_asymptotic(model, i),
+            "singular" => is_singular(model, i),
+            "nullity" => get_nullity(model, i),
+        ))
+    end
+
+    edges = []
+    g = vg.x_grh
+    for e in Graphs.edges(g)
+        push!(edges, Dict("source" => src(e), "target" => dst(e)))
+    end
+
+    return Dict("nodes" => nodes, "edges" => edges)
+end
+
+# ─── SISO data extractor ───
+function siso_to_dict(model, siso)
+    change_sym = string(qK_sym(model)[siso.change_qK_idx])
+    paths_data = []
+    for (i, path) in enumerate(siso.rgm_paths)
+        perms = [collect(get_perm(model, idx)) for idx in path]
+        push!(paths_data, Dict(
+            "idx" => i,
+            "vertex_indices" => collect(path),
+            "perms" => perms,
+        ))
+    end
+
+    sources_perms = [collect(get_perm(model, s)) for s in siso.sources]
+    sinks_perms = [collect(get_perm(model, s)) for s in siso.sinks]
+
+    return Dict(
+        "change_qK" => change_sym,
+        "change_qK_idx" => siso.change_qK_idx,
+        "sources" => collect(siso.sources),
+        "sinks" => collect(siso.sinks),
+        "sources_perms" => sources_perms,
+        "sinks_perms" => sinks_perms,
+        "n_paths" => length(siso.rgm_paths),
+        "paths" => paths_data,
+    )
+end
+
+# ─── Polyhedron extractor (H-rep to JSON) ───
+function polyhedron_to_dict(poly)
+    poly === nothing && return nothing
+    try
+        h = MixedMatHRep(hrep(poly))
+        A = mat2vv(Matrix(h.A))
+        b = Vector(h.b)
+        result = Dict("A" => A, "b" => b)
+        # Try to get vertices
+        try
+            v = MixedMatVRep(vrep(poly))
+            if size(v.V, 1) > 0
+                result["vertices"] = mat2vv(Matrix(v.V))
+            end
+        catch; end
+        return result
+    catch e
+        return Dict("error" => string(e))
+    end
+end
+
+# Build a conservation matrix L anchored on free species:
+# L = [I_d  Z'] with N_bound * Z = -N_free so that N * L' = 0.
+function derive_atomic_totals_matrix(N::Matrix{Int}, n_free::Int)
+    r, n = size(N)
+    d = n_free
+    d > 0 || error("At least one free species is required")
+    n == d + r || error("x-space closed-form requires n = d + r, got n=$n, d=$d, r=$r")
+
+    N_free = Rational{Int}.(N[:, 1:d])
+    N_bound = Rational{Int}.(N[:, d+1:end])
+    size(N_bound, 1) == size(N_bound, 2) || error("Bound block of N must be square for anchored totals")
+    rank(Float64.(N_bound)) == size(N_bound, 1) || error("Bound block of N is singular; cannot derive anchored totals")
+
+    Z = -(N_bound \ N_free) # r × d
+    L_rat = hcat(Matrix{Rational{Int}}(I, d, d), transpose(Z))
+
+    residual = Rational{Int}.(N) * transpose(L_rat)
+    all(iszero, residual) || error("Failed to derive valid conservation matrix (N * L' != 0)")
+
+    L = Float64.(L_rat)
+    L[abs.(L) .< 1e-12] .= 0.0
+    return L
+end
+
+function compute_rop_cloud_xspace(rules::Vector{String}, n_samples::Int, logx_min::Float64, logx_max::Float64;
+    target_species::Union{Nothing,Symbol}=nothing)
+    logx_max > logx_min || error("logx_max must be greater than logx_min")
+
+    N, species, free_syms, prod_syms = parse_network_structure(rules)
+    L = derive_atomic_totals_matrix(N, length(free_syms))
+
+    r, n = size(N)
+    d = size(L, 1)
+    n == d + r || error("Internal error: expected n=d+r")
+
+    target_sym = if isnothing(target_species)
+        !isempty(prod_syms) ? prod_syms[1] : species[end]
+    else
+        target_species
+    end
+    target_idx = findfirst(==(target_sym), species)
+    target_idx === nothing && error("target_species '$target_sym' not found in species: $(join(string.(species), ", "))")
+
+    reaction_orders = Matrix{Float64}(undef, n_samples, d)
+    target_values = Vector{Float64}(undef, n_samples)
+
+    Nf = Float64.(N)
+    A = Matrix{Float64}(undef, n, n)
+    A[d+1:end, :] .= Nf
+    e_target = zeros(Float64, n)
+    e_target[target_idx] = 1.0
+
+    accepted = 0
+    attempts = 0
+    max_attempts = max(10 * n_samples, n_samples + 1000)
+
+    while accepted < n_samples && attempts < max_attempts
+        attempts += 1
+
+        logx = logx_min .+ (logx_max - logx_min) .* rand(n)
+        x = exp10.(logx)
+        t = L * x
+        if any(!isfinite, t) || any(t .<= 0.0)
+            continue
+        end
+
+        @views A[1:d, :] .= (L .* transpose(x)) ./ t
+        y = try
+            A' \ e_target
+        catch err
+            if err isa SingularException || err isa LinearAlgebra.LAPACKException
+                continue
+            else
+                rethrow(err)
+            end
+        end
+
+        if any(!isfinite, y)
+            continue
+        end
+
+        accepted += 1
+        @views reaction_orders[accepted, :] .= y[1:d]
+        target_values[accepted] = x[target_idx]
+    end
+
+    accepted == n_samples || error("Only accepted $accepted / $n_samples samples (attempts=$attempts)")
+
+    q_sym = Symbol.("t" .* String.(free_syms))
+    return reaction_orders, target_values, q_sym, d, species[target_idx]
+end
+
+# ─── ROP point cloud computation ───
+function compute_rop_cloud(model, kd, prod_syms_sym, n_samples, span)
+    logK = log10.(kd)
+    logq_min = minimum(logK) - span
+    logq_max = maximum(logK) + span
+
+    d = model.d
+    prod_idx = [locate_sym_x(model, s) for s in prod_syms_sym]
+
+    # Allocate output
+    reaction_orders = Matrix{Float64}(undef, n_samples, d)
+    fret_values = Vector{Float64}(undef, n_samples)
+
+    for k in 1:n_samples
+        logq = logq_min .+ (logq_max - logq_min) .* rand(d)
+        logqK = vcat(logq, logK)
+        x = qK2x(model, logqK; input_logspace=true, output_logspace=false)
+        J = ∂logx_∂logqK(model; qK=logqK, input_logspace=true)
+
+        # Weighted reaction orders for FRET proxy
+        w = x[prod_idx] ./ sum(x[prod_idx])
+        ro = vec(w' * J[prod_idx, 1:d])
+        reaction_orders[k, :] = ro
+        fret_values[k] = sum(x[prod_idx])
+    end
+
+    return reaction_orders, fret_values
+end
+
+# ─── SISO trajectory computation ───
+function compute_siso_trajectory(model, siso, path_idx; npoints=500, start_val=-6, stop_val=6)
+    path_idx_int = path_idx
+    poly = get_polyhedron(siso, path_idx_int)
+    params = get_one_inner_point(poly; rand_line=false, rand_ray=false, extend=4)
+
+    change_idx = siso.change_qK_idx
+
+    start_logqK = copy(params) |> x -> insert!(x, change_idx, start_val)
+    end_logqK = copy(params) |> x -> insert!(x, change_idx, stop_val)
+
+    t_ode, logx_traj = x_traj_with_qK_change(model, start_logqK, end_logqK;
+        input_logspace=true, output_logspace=true, npoints=npoints, ensure_manifold=true)
+
+    # t_ode is in [0,1], map to actual logqK change values
+    change_values = start_val .+ t_ode .* (stop_val - start_val)
+
+    regimes = [assign_vertex_x(model, lx; input_logspace=true, return_idx=true) for lx in logx_traj]
+
+    # Convert to matrix
+    logx_mat = reduce(hcat, logx_traj)'  # npoints × n
+
+    return Dict(
+        "change_values" => collect(change_values),
+        "logx" => mat2vv(Matrix(logx_mat)),
+        "regimes" => regimes,
+        "x_sym" => string.(model.x_sym),
+        "change_sym" => string(qK_sym(model)[change_idx]),
+        "parameters" => params,
+    )
+end
+
+# ─── API Route Handlers ───
+
+function handle_build_model(req)
+    body = read_json(req)
+    rules = String.(body[:reactions])
+    kd = Float64.(body[:kd])
+    sid = get(body, :session_id, string(rand(UInt32), base=16))
+
+    # Validate Kd values
+    if any(x -> x <= 0, kd)
+        return error_response("All Kd values must be positive (> 0)"; status=400)
+    end
+
+    model, species, free_syms, prod_syms = build_model(rules, kd)
+    MODELS[sid] = Dict(
+        "model" => model,
+        "species" => species,
+        "free_syms" => free_syms,
+        "prod_syms" => prod_syms,
+        "kd" => kd,
+        "rules" => rules,
+        "last_access" => time(),
+    )
+
+    return json_response(Dict(
+        "session_id" => sid,
+        "n" => model.n, "d" => model.d, "r" => model.r,
+        "species" => string.(species),
+        "free_species" => string.(free_syms),
+        "product_species" => string.(prod_syms),
+        "x_sym" => string.(model.x_sym),
+        "q_sym" => string.(model.q_sym),
+        "K_sym" => string.(model.K_sym),
+        "N" => mat2vv(Matrix(model.N)),
+        "L" => mat2vv(Matrix(model.L)),
+    ))
+end
+
+function handle_find_vertices(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+
+    find_all_vertices!(model)
+
+    vertices = []
+    for i in 1:n_vertices(model)
+        perm = get_perm(model, i)
+        species_names = [string(model.x_sym[j]) for j in perm]
+        push!(vertices, Dict(
+            "idx" => i,
+            "perm" => collect(perm),
+            "species" => species_names,
+            "asymptotic" => is_asymptotic(model, i),
+            "singular" => is_singular(model, i),
+            "nullity" => get_nullity(model, i),
+        ))
+    end
+
+    return json_response(Dict(
+        "n_vertices" => n_vertices(model),
+        "vertices" => vertices,
+    ))
+end
+
+function handle_build_graph(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+
+    get_vertices_graph!(model; full=true)
+    data = graph_to_dict(model)
+    return json_response(data)
+end
+
+function handle_siso_paths(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+    change_qK = Symbol(body[:change_qK])
+
+    siso = SISOPaths(model, change_qK)
+    sess["siso_$(body[:change_qK])"] = siso
+
+    data = siso_to_dict(model, siso)
+    return json_response(data)
+end
+
+function handle_siso_polyhedra(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+    change_key = "siso_$(body[:change_qK])"
+    siso = get(sess, change_key, nothing)
+    siso === nothing && return error_response("SISO paths not computed for this qK coordinate"; status=404)
+
+    path_indices = haskey(body, :path_indices) ? Int.(body[:path_indices]) : collect(1:length(siso.rgm_paths))
+    # Limit to avoid huge computation
+    path_indices = path_indices[1:min(length(path_indices), 50)]
+
+    polys = get_polyhedra(siso, path_indices)
+    poly_data = []
+    for (i, pi) in enumerate(path_indices)
+        pd = polyhedron_to_dict(polys[i])
+        pd["path_idx"] = pi
+        pd["path"] = collect(siso.rgm_paths[pi])
+        pd["perms"] = [collect(get_perm(model, idx)) for idx in siso.rgm_paths[pi]]
+        push!(poly_data, pd)
+    end
+
+    return json_response(Dict("polyhedra" => poly_data))
+end
+
+function handle_siso_trajectory(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+    change_key = "siso_$(body[:change_qK])"
+    siso = get(sess, change_key, nothing)
+    siso === nothing && return error_response("SISO paths not computed for this qK coordinate"; status=404)
+
+    path_idx = Int(body[:path_idx])
+
+    # Validate path_idx
+    if path_idx < 1 || path_idx > length(siso.rgm_paths)
+        return error_response("path_idx out of range (1-$(length(siso.rgm_paths)))"; status=400)
+    end
+
+    npoints = clamp(get(body, :npoints, 500), 10, 5000)
+    start_val = get(body, :start, -6)
+    stop_val = get(body, :stop, 6)
+
+    data = compute_siso_trajectory(model, siso, path_idx;
+        npoints=npoints, start_val=start_val, stop_val=stop_val)
+    return json_response(data)
+end
+
+function handle_rop_cloud(req)
+    body = read_json(req)
+    mode = lowercase(String(get(body, :sampling_mode, "qk")))
+
+    n_samples = clamp(Int(get(body, :n_samples, 10000)), 100, 100000)
+
+    if mode == "x_space"
+        rules = if haskey(body, :reactions)
+            String.(body[:reactions])
+        else
+            haskey(body, :session_id) || return error_response("x-space mode requires reactions or session_id"; status=400)
+            sid = String(body[:session_id])
+            sess = get(MODELS, sid, nothing)
+            sess === nothing && return error_response("Invalid session_id"; status=404)
+            sess["last_access"] = time()
+            String.(sess["rules"])
+        end
+
+        isempty(rules) && return error_response("At least one reaction is required"; status=400)
+
+        logx_min = Float64(get(body, :logx_min, -6.0))
+        logx_max = Float64(get(body, :logx_max, 6.0))
+        logx_min = clamp(logx_min, -20.0, 20.0)
+        logx_max = clamp(logx_max, -20.0, 20.0)
+        logx_max > logx_min || return error_response("logx_max must be greater than logx_min"; status=400)
+
+        target_species = if haskey(body, :target_species)
+            raw = strip(String(body[:target_species]))
+            isempty(raw) ? nothing : Symbol(raw)
+        else
+            nothing
+        end
+
+        ro, target_vals, q_sym, d, target_sym = compute_rop_cloud_xspace(
+            rules, n_samples, logx_min, logx_max; target_species=target_species
+        )
+
+        return json_response(Dict(
+            "reaction_orders" => mat2vv(ro),
+            "fret_values" => target_vals, # kept for plotting color compatibility
+            "q_sym" => string.(q_sym),
+            "d" => d,
+            "sampling_mode" => mode,
+            "target_species" => string(target_sym),
+        ))
+    elseif mode == "qk"
+        haskey(body, :session_id) || return error_response("qK mode requires session_id"; status=400)
+        sid = String(body[:session_id])
+        sess = get(MODELS, sid, nothing)
+        sess === nothing && return error_response("Invalid session_id"; status=404)
+        sess["last_access"] = time()
+
+        model = sess["model"]
+        kd = sess["kd"]
+        prod_syms = Symbol.(sess["prod_syms"])
+
+        span = clamp(Int(get(body, :span, 6)), 1, 20)
+        ro, fret = compute_rop_cloud(model, kd, prod_syms, n_samples, span)
+
+        return json_response(Dict(
+            "reaction_orders" => mat2vv(ro),
+            "fret_values" => fret,
+            "q_sym" => string.(model.q_sym),
+            "d" => model.d,
+            "sampling_mode" => mode,
+        ))
+    else
+        return error_response("Unsupported sampling_mode '$mode' (use 'qk' or 'x_space')"; status=400)
+    end
+end
+
+function handle_vertex_detail(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+    idx = Int(body[:vertex_idx])
+
+    if idx < 1 || idx > n_vertices(model)
+        return error_response("vertex_idx out of range (1-$(n_vertices(model)))"; status=400)
+    end
+
+    data = vertex_to_dict(model, idx)
+    return json_response(data)
+end
+
+# ─── FRET heatmap computation (2D only) ───
+function handle_fret_heatmap(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+    kd = sess["kd"]
+    prod_syms = Symbol.(sess["prod_syms"])
+
+    n_grid = clamp(get(body, :n_grid, 80), 20, 300)
+    logq_min = get(body, :logq_min, -6)
+    logq_max = get(body, :logq_max, 6)
+    logK = log10.(kd)
+
+    model.d == 2 || return error_response("FRET heatmap only supports d=2"; status=400)
+
+    prod_idx = [locate_sym_x(model, s) for s in prod_syms]
+    logq1 = range(logq_min, logq_max, length=n_grid)
+    logq2 = range(logq_min, logq_max, length=n_grid)
+
+    fret = zeros(Float64, n_grid, n_grid)
+    regime = zeros(Int, n_grid, n_grid)
+
+    for (i, lq1) in enumerate(logq1)
+        for (j, lq2) in enumerate(logq2)
+            logqK = vcat([lq1, lq2], logK)
+            x = qK2x(model, logqK; input_logspace=true, output_logspace=false)
+            fret[i, j] = sum(x[prod_idx])
+            regime[i, j] = assign_vertex_qK(model, logqK; input_logspace=true, return_idx=true)
+        end
+    end
+
+    bounds = find_bounds(regime)
+
+    return json_response(Dict(
+        "logq1" => collect(logq1),
+        "logq2" => collect(logq2),
+        "fret" => mat2vv(fret),
+        "regime" => mat2vv(regime),
+        "bounds" => mat2vv(Float64.(bounds)),
+        "q_sym" => string.(model.q_sym),
+    ))
+end
+
+# ─── New API handlers for parameter scanning ───
+function handle_parameter_scan_1d(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+
+    # Parse parameters
+    param_symbol = Symbol(body[:param_symbol])
+    param_idx = locate_sym_qK(model, param_symbol)
+    param_idx === nothing && return error_response("Unknown parameter: $param_symbol"; status=400)
+
+    param_min = Float64(get(body, :param_min, -6.0))
+    param_max = Float64(get(body, :param_max, 6.0))
+    n_points = clamp(Int(get(body, :n_points, 200)), 10, 1000)
+
+    # Parse output expressions
+    output_exprs_raw = body[:output_exprs]
+    # Normalize to array if single string provided
+    output_exprs = if output_exprs_raw isa String
+        [String(output_exprs_raw)]
+    else
+        String.(output_exprs_raw)
+    end
+    isempty(output_exprs) && return error_response("At least one output expression required"; status=400)
+
+    output_coeffs = Vector{Vector{Float64}}()
+    for expr in output_exprs
+        try
+            coeffs = parse_linear_combination(model, expr)
+            push!(output_coeffs, coeffs)
+        catch e
+            return error_response("Invalid expression '$expr': $(sprint(showerror, e))"; status=400)
+        end
+    end
+
+    # Fixed parameters (all qK except the scanned one)
+    fixed_qK = if haskey(body, :fixed_qK)
+        Float64.(body[:fixed_qK])
+    else
+        # Default: all zeros (log-space), meaning all parameters = 1
+        zeros(Float64, model.n)
+    end
+
+    # Remove scanned parameter from fixed_qK
+    fixed_params = deleteat!(copy(fixed_qK), param_idx)
+
+    # Scan
+    param_range = range(param_min, param_max, length=n_points) |> collect
+    param_vals, output_traj, regimes = scan_parameter_1d(
+        model, param_idx, param_range, output_coeffs, fixed_params;
+        input_logspace=true, output_logspace=true
+    )
+
+    return json_response(Dict(
+        "param_symbol" => string(param_symbol),
+        "param_values" => param_vals,
+        "output_exprs" => output_exprs,
+        "output_traj" => mat2vv(output_traj),
+        "regimes" => regimes,
+        "x_sym" => string.(model.x_sym),
+    ))
+end
+
+function handle_parameter_scan_2d(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+
+    # Parse parameters
+    param1_symbol = Symbol(body[:param1_symbol])
+    param2_symbol = Symbol(body[:param2_symbol])
+    param1_idx = locate_sym_qK(model, param1_symbol)
+    param2_idx = locate_sym_qK(model, param2_symbol)
+    param1_idx === nothing && return error_response("Unknown parameter: $param1_symbol"; status=400)
+    param2_idx === nothing && return error_response("Unknown parameter: $param2_symbol"; status=400)
+    param1_idx == param2_idx && return error_response("Parameters must be different"; status=400)
+
+    param1_min = Float64(get(body, :param1_min, -6.0))
+    param1_max = Float64(get(body, :param1_max, 6.0))
+    param2_min = Float64(get(body, :param2_min, -6.0))
+    param2_max = Float64(get(body, :param2_max, 6.0))
+    n_grid = clamp(Int(get(body, :n_grid, 80)), 20, 200)
+
+    # Parse output expression (single output for heatmap)
+    output_expr = String(body[:output_expr])
+    output_coeffs = try
+        parse_linear_combination(model, output_expr)
+    catch e
+        return error_response("Invalid expression '$output_expr': $(sprint(showerror, e))"; status=400)
+    end
+
+    # Fixed parameters
+    fixed_qK = if haskey(body, :fixed_qK)
+        Float64.(body[:fixed_qK])
+    else
+        zeros(Float64, model.n)
+    end
+
+    # Remove both scanned parameters (in descending order to avoid index shifts)
+    indices_to_remove = sort([param1_idx, param2_idx], rev=true)
+    fixed_params = copy(fixed_qK)
+    for idx in indices_to_remove
+        deleteat!(fixed_params, idx)
+    end
+
+    # Scan
+    param1_range = range(param1_min, param1_max, length=n_grid) |> collect
+    param2_range = range(param2_min, param2_max, length=n_grid) |> collect
+
+    param1_vals, param2_vals, output_grid, regime_grid = scan_parameter_2d(
+        model, param1_idx, param2_idx, param1_range, param2_range,
+        output_coeffs, fixed_params;
+        input_logspace=true, output_logspace=true
+    )
+
+    return json_response(Dict(
+        "param1_symbol" => string(param1_symbol),
+        "param2_symbol" => string(param2_symbol),
+        "param1_values" => param1_vals,
+        "param2_values" => param2_vals,
+        "output_expr" => output_expr,
+        "output_grid" => mat2vv(output_grid),
+        "regime_grid" => mat2vv(regime_grid),
+    ))
+end
+
+function handle_rop_polyhedron(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+
+    # Parse output expression
+    output_expr = String(body[:output_expr])
+    output_coeffs = try
+        parse_linear_combination(model, output_expr)
+    catch e
+        return error_response("Invalid expression '$output_expr': $(sprint(showerror, e))"; status=400)
+    end
+
+    # Parse parameters
+    param1_symbol = Symbol(body[:param1_symbol])
+    param2_symbol = Symbol(body[:param2_symbol])
+    param1_idx = locate_sym_qK(model, param1_symbol)
+    param2_idx = locate_sym_qK(model, param2_symbol)
+    param1_idx === nothing && return error_response("Unknown parameter: $param1_symbol"; status=400)
+    param2_idx === nothing && return error_response("Unknown parameter: $param2_symbol"; status=400)
+    param1_idx == param2_idx && return error_response("Parameters must be different"; status=400)
+
+    asymptotic_only = get(body, :asymptotic_only, true)
+    max_vertices = clamp(Int(get(body, :max_vertices, 1000)), 10, 5000)
+
+    # Compute polyhedron
+    poly_data = try
+        compute_rop_polyhedron(model, output_coeffs, param1_idx, param2_idx;
+                               asymptotic_only=asymptotic_only, max_vertices=max_vertices)
+    catch e
+        return error_response("Failed to compute polyhedron: $(sprint(showerror, e))"; status=500)
+    end
+
+    # Format vertices for JSON
+    vertices_json = []
+    for (ro1, ro2, idx, nullity, perm) in poly_data["vertices"]
+        push!(vertices_json, Dict(
+            "ro1" => ro1,
+            "ro2" => ro2,
+            "idx" => idx,
+            "nullity" => nullity,
+            "perm" => perm,
+        ))
+    end
+
+    return json_response(Dict(
+        "output_expr" => output_expr,
+        "param1_symbol" => string(param1_symbol),
+        "param2_symbol" => string(param2_symbol),
+        "vertices" => vertices_json,
+        "edges" => poly_data["edges"],
+    ))
+end
+
+
+function serve_static(req)
+    path = HTTP.URI(req.target).path
+    # Default to node edition
+    path = path == "/" ? "/index-node.html" : path
+    filepath = joinpath(static_dir(), lstrip(path, '/'))
+
+    if !isfile(filepath)
+        return HTTP.Response(404, "Not found")
+    end
+
+    ext = splitext(filepath)[2]
+    mime = Dict(
+        ".html" => "text/html",
+        ".js" => "application/javascript",
+        ".css" => "text/css",
+        ".json" => "application/json",
+        ".png" => "image/png",
+        ".svg" => "image/svg+xml",
+    )
+    content_type = get(mime, ext, "application/octet-stream")
+    return HTTP.Response(200, ["Content-Type" => content_type], read(filepath))
+end
+
+# ─── Router ───
+const API_ROUTES = Dict{String, Function}(
+    "/api/build_model" => handle_build_model,
+    "/api/find_vertices" => handle_find_vertices,
+    "/api/build_graph" => handle_build_graph,
+    "/api/siso_paths" => handle_siso_paths,
+    "/api/siso_polyhedra" => handle_siso_polyhedra,
+    "/api/siso_trajectory" => handle_siso_trajectory,
+    "/api/rop_cloud" => handle_rop_cloud,
+    "/api/vertex_detail" => handle_vertex_detail,
+    "/api/fret_heatmap" => handle_fret_heatmap,
+    "/api/parameter_scan_1d" => handle_parameter_scan_1d,
+    "/api/parameter_scan_2d" => handle_parameter_scan_2d,
+    "/api/rop_polyhedron" => handle_rop_polyhedron,
+)
+
+function router(req)
+    # CORS preflight
+    if req.method == "OPTIONS"
+        return HTTP.Response(200, [
+            "Access-Control-Allow-Origin" => "*",
+            "Access-Control-Allow-Methods" => "POST, GET, OPTIONS",
+            "Access-Control-Allow-Headers" => "Content-Type",
+        ])
+    end
+
+    path = HTTP.URI(req.target).path
+
+    if haskey(API_ROUTES, path) && req.method == "POST"
+        try
+            return API_ROUTES[path](req)
+        catch e
+            @error "API error" path exception=(e, catch_backtrace())
+            # Distinguish between user errors (400) and server errors (500)
+            if isa(e, ArgumentError) || isa(e, DomainError) || isa(e, BoundsError)
+                return error_response("Invalid request: $(sprint(showerror, e))"; status=400)
+            else
+                return error_response("Internal server error"; status=500)
+            end
+        end
+    end
+
+    # Static files
+    return serve_static(req)
+end
+
+# ─── Start server ───
+function main()
+    port = resolve_port()
+    @info "ROP Web Server starting on http://localhost:$port"
+    @info "Static files from: $(static_dir())"
+    @info "Session TTL: $(SESSION_TTL)s, cleanup interval: $(SESSION_CLEANUP_INTERVAL)s"
+
+    # Start session cleanup task in background
+    @async cleanup_old_sessions()
+
+    HTTP.serve(router, "0.0.0.0", port)
+end
+
+function julia_main()::Cint
+    try
+        main()
+        return 0
+    catch err
+        showerror(stderr, err, catch_backtrace())
+        println(stderr)
+        return 1
+    end
+end
+
+end # module

@@ -1,0 +1,12 @@
+.DS_Store
+*.log
+*.out
+
+.julia_packaging_depot/
+dist/
+
+desktop/node_modules/
+desktop/release/
+desktop/release-packager/
+
+webapp/.claude/
