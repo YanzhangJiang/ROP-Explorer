@@ -101,6 +101,10 @@ if (!window.Plotly) {
     <button class="btn-icon" onclick="saveState()" title="Save Workspace">&#x1F4BE;</button>
     <button class="btn-icon" onclick="loadState()" title="Load Workspace">&#x1F4C2;</button>
     <button class="btn-icon" onclick="resetView()" title="Reset View">&#x27F2;</button>
+    <button class="toolbar-btn toolbar-btn-debug" id="debug-console-btn" title="Show backend debug console">
+      Debug
+      <span id="debug-console-indicator" class="debug-console-indicator" style="display:none;"></span>
+    </button>
     <span id="status-badge" class="badge">Ready</span>
   </div>
 </div>
@@ -110,6 +114,25 @@ if (!window.Plotly) {
     <svg id="svg-layer"></svg>
   </div>
 </div>
+
+<aside id="debug-console" aria-hidden="true">
+  <div class="debug-console-header">
+    <div>
+      <div class="debug-console-title">Debug Console</div>
+      <div class="debug-console-subtitle">Backend logs</div>
+    </div>
+    <div class="debug-console-actions">
+      <button class="btn-icon btn-icon-small" id="debug-console-refresh" title="Refresh logs">&#x21BB;</button>
+      <button class="btn-icon btn-icon-small" id="debug-console-close" title="Close debug console">&times;</button>
+    </div>
+  </div>
+  <div class="debug-console-toolbar">
+    <span class="debug-console-counter" id="debug-console-counter">0 lines</span>
+  </div>
+  <div class="debug-console-body" id="debug-console-body">
+    <div class="debug-console-empty">No backend logs captured yet.</div>
+  </div>
+</aside>
 
 <div id="toast-container"></div>
 

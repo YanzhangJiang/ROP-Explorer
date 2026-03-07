@@ -11,12 +11,91 @@ using CDDLib
 using Graphs
 using SparseArrays
 using Random
+using Logging
+using Dates
 
 # ─── Global state ───
 const MODELS = Dict{String, Any}()  # session_id => Dict with model + computed data
 const STATIC_DIR = Ref{Union{Nothing, String}}(nothing)
 const SESSION_TTL = 3600  # 1 hour in seconds
 const SESSION_CLEANUP_INTERVAL = 300  # 5 minutes
+const DEBUG_LOGS = Vector{Dict{String, Any}}()
+const DEBUG_LOG_LOCK = ReentrantLock()
+const DEBUG_LOG_SEQ = Ref(0)
+const DEBUG_LOG_LIMIT = 1500
+const DEBUG_LOGGER_INSTALLED = Ref(false)
+
+function _stringify_log_value(value)
+    if value isa AbstractString
+        return value
+    elseif value isa Symbol
+        return String(value)
+    else
+        return sprint(show, value)
+    end
+end
+
+function append_debug_log(level, message; module_name=nothing, group=nothing, file=nothing, line=nothing, details=nothing)
+    record = Dict{String, Any}(
+        "timestamp" => Dates.format(now(), dateformat"yyyy-mm-dd HH:MM:SS.s"),
+        "level" => uppercase(string(level)),
+        "message" => _stringify_log_value(message),
+    )
+    module_name === nothing || (record["module"] = _stringify_log_value(module_name))
+    group === nothing || (record["group"] = _stringify_log_value(group))
+    file === nothing || (record["file"] = _stringify_log_value(file))
+    line === nothing || (record["line"] = line)
+    details === nothing || isempty(String(details)) || (record["details"] = String(details))
+
+    lock(DEBUG_LOG_LOCK) do
+        DEBUG_LOG_SEQ[] += 1
+        record["seq"] = DEBUG_LOG_SEQ[]
+        push!(DEBUG_LOGS, record)
+        if length(DEBUG_LOGS) > DEBUG_LOG_LIMIT
+            deleteat!(DEBUG_LOGS, 1:(length(DEBUG_LOGS) - DEBUG_LOG_LIMIT))
+        end
+    end
+    return nothing
+end
+
+struct BufferingConsoleLogger <: AbstractLogger
+    console::AbstractLogger
+    min_level::LogLevel
+end
+
+Logging.min_enabled_level(logger::BufferingConsoleLogger) = logger.min_level
+Logging.shouldlog(logger::BufferingConsoleLogger, level, _module, group, id) = level >= logger.min_level
+Logging.catch_exceptions(::BufferingConsoleLogger) = false
+
+function Logging.handle_message(logger::BufferingConsoleLogger, level, message, _module, group, id, file, line; kwargs...)
+    details = String[]
+    for (key, value) in kwargs
+        if key === :exception
+            if value isa Tuple && length(value) >= 2
+                push!(details, sprint(showerror, value[1], value[2]))
+            else
+                push!(details, _stringify_log_value(value))
+            end
+        else
+            push!(details, string(key) * " = " * _stringify_log_value(value))
+        end
+    end
+    append_debug_log(level, message;
+        module_name=_module,
+        group=group,
+        file=file,
+        line=line,
+        details=isempty(details) ? nothing : join(details, "\n"),
+    )
+    Logging.handle_message(logger.console, level, message, _module, group, id, file, line; kwargs...)
+end
+
+function install_debug_logger!()
+    DEBUG_LOGGER_INSTALLED[] && return
+    DEBUG_LOGGER_INSTALLED[] = true
+    global_logger(BufferingConsoleLogger(current_logger(), Logging.Info))
+    append_debug_log("INFO", "Debug log capture initialized"; module_name=:ROPExplorerBackend)
+end
 
 function resolve_static_dir()
     candidates = String[]
@@ -184,6 +263,39 @@ function read_json(req)
     catch e
         error("Invalid JSON: $e")
     end
+end
+
+function handle_debug_logs(req)
+    body = read_json(req)
+    after_seq = max(0, Int(get(body, :after_seq, 0)))
+    limit = clamp(Int(get(body, :limit, 300)), 1, DEBUG_LOG_LIMIT)
+
+    entries = Dict{String, Any}[]
+    next_seq = 0
+    total = 0
+    lock(DEBUG_LOG_LOCK) do
+        total = length(DEBUG_LOGS)
+        if after_seq > 0
+            entries = [copy(entry) for entry in DEBUG_LOGS if Int(get(entry, "seq", 0)) > after_seq]
+        else
+            start_idx = max(1, total - limit + 1)
+            entries = [copy(entry) for entry in @view DEBUG_LOGS[start_idx:end]]
+        end
+        if !isempty(DEBUG_LOGS)
+            next_seq = Int(get(DEBUG_LOGS[end], "seq", 0))
+        end
+    end
+
+    if after_seq > 0 && length(entries) > limit
+        entries = entries[end-limit+1:end]
+    end
+
+    return json_response(Dict(
+        "entries" => entries,
+        "next_seq" => next_seq,
+        "total" => total,
+        "limit" => limit,
+    ))
 end
 
 # ─── Vertex data extractor ───
@@ -1199,6 +1311,7 @@ const API_ROUTES = Dict{String, Function}(
     "/api/parameter_scan_1d" => handle_parameter_scan_1d,
     "/api/parameter_scan_2d" => handle_parameter_scan_2d,
     "/api/rop_polyhedron" => handle_rop_polyhedron,
+    "/api/debug_logs" => handle_debug_logs,
 )
 
 function router(req)
@@ -1233,6 +1346,7 @@ end
 
 # ─── Start server ───
 function main()
+    install_debug_logger!()
     port = resolve_port()
     @info "ROP Web Server starting on http://localhost:$port"
     @info "Static files from: $(static_dir())"
@@ -1249,6 +1363,7 @@ function julia_main()::Cint
         main()
         return 0
     catch err
+        append_debug_log("ERROR", "Backend crashed during startup"; module_name=:ROPExplorerBackend, details=sprint(showerror, err, catch_backtrace()))
         showerror(stderr, err, catch_backtrace())
         println(stderr)
         return 1
