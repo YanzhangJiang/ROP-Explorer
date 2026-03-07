@@ -273,11 +273,11 @@ const NODE_TYPES = {
     title: 'SISO Behaviors',
     inputs: [{ port: 'params', label: 'Params' }],
     outputs: [{ port: 'result', label: 'Path' }],
-    defaultWidth: 420,
+    defaultWidth: 840,
     createBody(nodeId) {
       return `
         <button class="btn btn-small" onclick="computeSISOResult('${nodeId}')">Run</button>
-        <div class="viewer-content" id="${nodeId}-content"><span class="text-dim">Click Run to enumerate behavior families</span></div>
+        <div class="viewer-content siso-result-viewer" id="${nodeId}-content"><span class="text-dim">Click Run to enumerate behavior families</span></div>
       `;
     },
   },
@@ -1127,6 +1127,7 @@ let panX = 0, panY = 0, isPanning = false, startPanX = 0, startPanY = 0;
 let scale = 1.0;
 const MIN_SCALE = 0.1;
 const MAX_SCALE = 3.0;
+const ZOOM_SENSITIVITY = 0.0048;
 let isDraggingNode = false, draggedNode = null, nodeOffsetX = 0, nodeOffsetY = 0;
 let isWiring = false, wireStartSocket = null, wireStartIsOutput = true, tempWire = null;
 let isResizing = false, resizeNode = null, resizeStartX = 0, resizeStartY = 0, resizeStartW = 0, resizeStartH = 0;
@@ -1151,6 +1152,52 @@ function findScrollableAncestor(target, stopAt = editor) {
   return null;
 }
 
+function findWheelScrollableAncestor(target, deltaX, deltaY, stopAt = editor) {
+  let el = target instanceof Element ? target : null;
+  while (el && el !== stopAt) {
+    if (el.classList?.contains('node-body')) {
+      el = el.parentElement;
+      continue;
+    }
+
+    const style = window.getComputedStyle(el);
+    const canScrollY = ['auto', 'scroll'].includes(style.overflowY) && el.scrollHeight > el.clientHeight + 1;
+    const canScrollX = ['auto', 'scroll'].includes(style.overflowX) && el.scrollWidth > el.clientWidth + 1;
+    const canConsumeY = canScrollY && (
+      (deltaY < 0 && el.scrollTop > 0) ||
+      (deltaY > 0 && el.scrollTop + el.clientHeight < el.scrollHeight - 1)
+    );
+    const canConsumeX = canScrollX && (
+      (deltaX < 0 && el.scrollLeft > 0) ||
+      (deltaX > 0 && el.scrollLeft + el.clientWidth < el.scrollWidth - 1)
+    );
+
+    if (canConsumeY || canConsumeX) return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+
+function isInteractivePlotTarget(target) {
+  return target instanceof Element && !!target.closest('.plot-container, .js-plotly-plot, .plotly, .modebar');
+}
+
+function normalizeWheelDelta(delta, deltaMode) {
+  if (deltaMode === 1) {
+    return delta * 16;
+  }
+  if (deltaMode === 2) {
+    return delta * Math.max(editor.clientHeight, 800);
+  }
+  return delta;
+}
+
+function computeZoomFactor(e) {
+  const normalizedDelta = normalizeWheelDelta(e.deltaY, e.deltaMode);
+  const clampedDelta = Math.max(-240, Math.min(240, normalizedDelta));
+  return Math.exp(-clampedDelta * ZOOM_SENSITIVITY);
+}
+
 // Canvas panning (middle/right mouse button, or left-click on blank area)
 editor.addEventListener('mousedown', (e) => {
   if (e.button === 1 || e.button === 2) {
@@ -1168,7 +1215,11 @@ editor.addEventListener('mousedown', (e) => {
 
 // Wheel / trackpad panning and zooming
 editor.addEventListener('wheel', (e) => {
-  if (!(e.ctrlKey || e.metaKey) && findScrollableAncestor(e.target)) {
+  if (isInteractivePlotTarget(e.target)) {
+    return;
+  }
+
+  if (!(e.ctrlKey || e.metaKey) && findWheelScrollableAncestor(e.target, e.deltaX, e.deltaY)) {
     return;
   }
 
@@ -1176,9 +1227,9 @@ editor.addEventListener('wheel', (e) => {
 
   if (e.ctrlKey || e.metaKey) {
     // Zoom mode
-    const delta = -e.deltaY * 0.001;
     const oldScale = scale;
-    scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale + delta));
+    const zoomFactor = computeZoomFactor(e);
+    scale = Math.max(MIN_SCALE, Math.min(MAX_SCALE, scale * zoomFactor));
 
     // Calculate mouse position relative to editor
     const rect = editor.getBoundingClientRect();
@@ -1507,6 +1558,7 @@ function createNode(nodeType, x, y) {
   canvas.appendChild(node);
 
   nodeRegistry[nodeId] = { type: nodeType, el: node, data: {} };
+  setupNodeResizeObserver(nodeId, node);
 
   // Run init hook
   if (typeDef.onInit) typeDef.onInit(nodeId);
@@ -1519,6 +1571,7 @@ function removeNode(nodeId) {
   if (el) el.remove();
   connections = connections.filter(c => c.fromNode !== nodeId && c.toNode !== nodeId);
   delete nodeRegistry[nodeId];
+  cleanupNodeResizeObserver(nodeId);
   cleanupPlotResize(nodeId);
   updateConnections();
 }
@@ -2718,7 +2771,7 @@ function plotQKPolyhedron(polyData, qkSymbols, plotId) {
     xaxis: { title: qkSymbols[0], gridcolor: '#333', zerolinecolor: '#444' },
     yaxis: { title: qkSymbols[1], gridcolor: '#333', zerolinecolor: '#444' },
     showlegend: true,
-  }, { responsive: true, displayModeBar: false });
+  }, { responsive: true, displayModeBar: false, scrollZoom: true });
 }
 
 function renderQKPolyhedronResult(nodeId, selection, payload) {
@@ -2938,7 +2991,7 @@ function plotRegimeGraph(data, plotId) {
     title: { text: `${nodes.length} vertices, ${edges.length} edges`, font: { color: '#888', size: 11 }, y: 0.98, yanchor: 'top' },
   };
 
-  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
 }
 
 function plotTrajectory(data, plotId) {
@@ -2983,7 +3036,9 @@ function plotTrajectory(data, plotId) {
     legend: { bgcolor: 'rgba(0,0,0,0)', font: { color: '#888', size: 9 } },
   };
 
-  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
+  const plotEl = document.getElementById(plotId);
+  if (plotEl) setupPlotInteractionGuard(plotEl);
 }
 
 function plotROPCloud(data, plotId) {
@@ -3011,7 +3066,7 @@ function plotROPCloud(data, plotId) {
       title: { text: 'ROP Cloud (2D)', font: { color: '#888', size: 11 }, y: 0.98, yanchor: 'top' },
       xaxis: { title: `\u2202log/\u2202log ${q_sym[0]}`, gridcolor: '#333' },
       yaxis: { title: `\u2202log/\u2202log ${q_sym[1]}`, gridcolor: '#333' },
-    }, { responsive: true, displayModeBar: false });
+    }, { responsive: true, displayModeBar: false, scrollZoom: true });
   } else if (d === 3) {
     const x = reaction_orders.map(r => r[0]);
     const y = reaction_orders.map(r => r[1]);
@@ -3032,7 +3087,7 @@ function plotROPCloud(data, plotId) {
         zaxis: { title: `\u2202log/\u2202log ${q_sym[2]}`, gridcolor: '#333' },
         bgcolor: '#1a1a1a',
       },
-    }, { responsive: true, displayModeBar: false });
+    }, { responsive: true, displayModeBar: false, scrollZoom: true });
   } else {
     const x = reaction_orders.map(r => r[0]);
     const y = reaction_orders.map(r => r[1]);
@@ -3045,7 +3100,7 @@ function plotROPCloud(data, plotId) {
       title: { text: `ROP Cloud (first 2 of ${d} dims)`, font: { color: '#888', size: 11 }, y: 0.98, yanchor: 'top' },
       xaxis: { title: `\u2202log/\u2202log ${q_sym[0]}`, gridcolor: '#333' },
       yaxis: { title: `\u2202log/\u2202log ${q_sym[1]}`, gridcolor: '#333' },
-    }, { responsive: true, displayModeBar: false });
+    }, { responsive: true, displayModeBar: false, scrollZoom: true });
   }
 }
 
@@ -3075,7 +3130,7 @@ function plotHeatmap(data, plotId) {
     yaxis: { title: `log(${q_sym[1]})`, gridcolor: '#333' },
   };
 
-  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
 }
 
 // ===== Reset View =====
@@ -3539,6 +3594,51 @@ function restoreNodeData(nodeId, type, data) {
 
 // ===== Parameter Scan 1D Helper Functions =====
 const plotResizeObservers = new Map(); // nodeId -> ResizeObserver
+const nodeResizeObservers = new Map(); // nodeId -> ResizeObserver
+const plotInteractionGuards = new WeakSet();
+
+function setupNodeResizeObserver(nodeId, nodeEl) {
+  cleanupNodeResizeObserver(nodeId);
+  if (!nodeEl) return;
+
+  let rafId = null;
+  const observer = new ResizeObserver(() => {
+    if (rafId) cancelAnimationFrame(rafId);
+    rafId = requestAnimationFrame(() => {
+      const plotEls = nodeEl.querySelectorAll('.plot-container');
+      plotEls.forEach(plotEl => {
+        if (!plotEl.classList.contains('js-plotly-plot')) return;
+        Plotly.Plots.resize(plotEl);
+      });
+      updateConnections();
+      rafId = null;
+    });
+  });
+
+  observer.observe(nodeEl);
+  nodeResizeObservers.set(nodeId, observer);
+}
+
+function cleanupNodeResizeObserver(nodeId) {
+  if (nodeResizeObservers.has(nodeId)) {
+    nodeResizeObservers.get(nodeId).disconnect();
+    nodeResizeObservers.delete(nodeId);
+  }
+}
+
+function setupPlotInteractionGuard(plotEl) {
+  if (!plotEl || plotInteractionGuards.has(plotEl)) return;
+
+  plotEl.addEventListener('wheel', (e) => {
+    e.stopPropagation();
+  }, { passive: true });
+
+  plotEl.addEventListener('pointerdown', (e) => {
+    e.stopPropagation();
+  });
+
+  plotInteractionGuards.add(plotEl);
+}
 
 function setupPlotResize(nodeId, plotId) {
   // Clean up existing observer
@@ -3548,9 +3648,11 @@ function setupPlotResize(nodeId, plotId) {
 
   const plotEl = document.getElementById(plotId);
   if (!plotEl) return;
+  setupPlotInteractionGuard(plotEl);
 
   const observer = new ResizeObserver(() => {
     Plotly.Plots.resize(plotEl);
+    updateConnections();
   });
 
   observer.observe(plotEl);
@@ -4005,7 +4107,7 @@ function plotParameterScan1D(data, plotId) {
     legend: { x: 1, xanchor: 'right', y: 1 },
   };
 
-  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
 }
 
 // ===== Parameter Scan 2D Helper Functions =====
@@ -4124,7 +4226,7 @@ function plotParameterScan2D(data, plotId) {
     }
   };
 
-  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
 }
 
 // ===== ROP Polyhedron Helper Functions =====
@@ -4380,7 +4482,7 @@ function plotROPPolyhedron(data, plotId, options = {}) {
       layout.yaxis = { title: axisLabels[1] || 'Axis 2', gridcolor: '#333', zerolinecolor: '#444', range: ranges?.[1] };
     }
 
-    Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+    Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
     return;
   }
 
@@ -4425,7 +4527,7 @@ function plotROPPolyhedron(data, plotId, options = {}) {
     showlegend: true,
   };
 
-  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+  Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false, scrollZoom: true });
 }
 
 // ===== Auto-update Config Nodes =====

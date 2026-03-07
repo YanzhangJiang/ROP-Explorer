@@ -445,7 +445,7 @@ textarea {
 /* ===== Viewer Content ===== */
 .viewer-content {
   background: #1a1a1a; border: 1px solid #333; border-radius: 4px;
-  padding: 8px; margin-top: 10px; overflow-y: auto;
+  padding: 8px; margin-top: 10px; overflow-y: auto; overflow-x: hidden;
   font-size: 11px;
   flex: 1;
   min-height: 0;
@@ -594,6 +594,18 @@ textarea {
 
 .siso-table-wrap {
   overflow-x: auto;
+}
+
+.siso-result-viewer,
+.siso-result-viewer .path-list,
+.siso-result-viewer .scroll-panel,
+.siso-result-viewer .siso-table-wrap {
+  overflow-x: hidden;
+}
+
+.siso-result-viewer .siso-family-table {
+  width: 100%;
+  table-layout: fixed;
 }
 
 .siso-family-table td {
