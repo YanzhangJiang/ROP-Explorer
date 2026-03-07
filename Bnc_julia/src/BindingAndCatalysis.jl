@@ -26,6 +26,7 @@ export find_all_vertices
 # include("regimes.jl")
 export find_all_vertices!, get_vertices_perm_dict, get_nullities, get_volumes, have_perm
 export get_vertices
+export get_vertices_neighbor_mat
 export is_singular, is_asymptotic, n_vertices
 
 export get_idx, get_perm, get_vertex, get_neighbors, get_nullity, get_one_inner_point
@@ -57,6 +58,7 @@ export get_path, get_edge, get_intersect
 export get_neighbor_graph_x, get_neighbor_graph_qK,get_neighbor_graph
 export get_sources, get_sinks, get_sources_sinks
 export get_RO_path, group_sum, get_RO_paths, summary_RO_path
+export get_behavior_families, summary_behavior_families
 export get_vertex_rop_coords, get_edge_rop_segment, compute_rop_polyhedron
 # export get_volume, get_C_C0_nullity_qK
 
@@ -65,5 +67,6 @@ export SISO_plot, get_edge_labels,set_proper_bounds_for_graph_plot!
 export get_node_positions, get_node_colors, get_node_labels, get_node_size
 export draw_graph, add_vertices_idx!,add_arrows!,add_nodes_text!, set_node_positions
 export draw_qK_neighbor_grh, find_bounds, add_rgm_colorbar!, get_color_map
+export get_ROP_plot_data, draw_ROP
 
 end # module

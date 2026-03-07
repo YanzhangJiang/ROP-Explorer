@@ -1110,6 +1110,388 @@ function summary_RO_path(grh::SISOPaths;observe_x, show_volume::Bool=true,
 end
 
 
+"""
+    _normalize_behavior_scope(scope) -> Symbol
+
+Normalize behavior-family path filtering scope.
+"""
+function _normalize_behavior_scope(scope)::Symbol
+    scope_sym = Symbol(scope)
+    scope_sym in (:all, :feasible, :robust) || error("Unsupported path_scope=$scope. Use :all, :feasible, or :robust.")
+    return scope_sym
+end
+
+"""
+    _ro_token(x; zero_tol=1e-6) -> String
+
+Map a reaction-order value to a motif token.
+"""
+function _ro_token(x::Real; zero_tol::Real=1e-6)::String
+    if isnan(x)
+        return "NaN"
+    elseif isinf(x)
+        return signbit(x) ? "-Inf" : "+Inf"
+    elseif abs(x) <= zero_tol
+        return "0"
+    else
+        return x > 0 ? "+" : "-"
+    end
+end
+
+"""
+    _motif_profile(ord_path; zero_tol=1e-6) -> Vector{String}
+
+Convert an exact reaction-order profile to a coarse motif profile.
+"""
+_motif_profile(ord_path::AbstractVector{<:Real}; zero_tol::Real=1e-6)::Vector{String} =
+    map(x -> _ro_token(x; zero_tol=zero_tol), ord_path)
+
+"""
+    _motif_label(motif_profile) -> String
+
+Assign a coarse behavior label to a motif profile.
+"""
+function _motif_label(motif_profile::AbstractVector{<:AbstractString})::String
+    isempty(motif_profile) && return "empty"
+
+    has_singular = any(x -> x == "NaN" || x == "+Inf" || x == "-Inf", motif_profile)
+    coarse = map(motif_profile) do token
+        token == "+Inf" ? "+" : token == "-Inf" ? "-" : token == "NaN" ? "0" : token
+    end
+
+    label = if all(==("0"), coarse)
+        "flat"
+    elseif all(==("+"), coarse)
+        length(coarse) == 1 ? "monotone_activation" : "multistage_activation"
+    elseif all(==("-"), coarse)
+        length(coarse) == 1 ? "monotone_repression" : "multistage_repression"
+    else
+        nz = filter(!=("0"), coarse)
+        first_nz = findfirst(!=("0"), coarse)
+        last_nz = findlast(!=("0"), coarse)
+        sign_changes = length(nz) <= 1 ? 0 : count(i -> nz[i] != nz[i+1], 1:(length(nz)-1))
+
+        if !isempty(nz) && all(x -> x == "+" || x == "0", coarse)
+            if first_nz > 1 && last_nz < length(coarse)
+                "band_pass_like"
+            elseif first_nz > 1
+                "thresholded_activation"
+            elseif last_nz < length(coarse)
+                "activation_with_saturation"
+            else
+                "positive_motif"
+            end
+        elseif !isempty(nz) && all(x -> x == "-" || x == "0", coarse)
+            if first_nz > 1 && last_nz < length(coarse)
+                "window_repression"
+            elseif first_nz > 1
+                "thresholded_repression"
+            elseif last_nz < length(coarse)
+                "repression_with_floor"
+            else
+                "negative_motif"
+            end
+        elseif sign_changes == 1 && first(nz) == "+" && last(nz) == "-"
+            "biphasic_peak"
+        elseif sign_changes == 1 && first(nz) == "-" && last(nz) == "+"
+            "biphasic_valley"
+        else
+            "complex_motif"
+        end
+    end
+
+    return has_singular ? label * "_with_singular_transition" : label
+end
+
+"""
+    _sum_volumes(volumes) -> Union{Nothing, Volume}
+
+Sum `Volume` objects, returning `nothing` for an empty list.
+"""
+function _sum_volumes(volumes::AbstractVector)
+    isempty(volumes) && return nothing
+    return foldl(+, volumes; init=zero(first(volumes)))
+end
+
+"""
+    _representative_path_idx(path_ids, path_records) -> Int
+
+Pick the path with the largest known volume, falling back to the first path when
+volume data is unavailable.
+"""
+function _representative_path_idx(path_ids::AbstractVector{<:Integer}, path_records::AbstractVector)::Int
+    isempty(path_ids) && return 0
+    scores = map(path_ids) do path_idx
+        vol = path_records[path_idx].volume
+        isnothing(vol) ? -Inf : vol.mean
+    end
+    max_score = maximum(scores)
+    return isfinite(max_score) ? path_ids[argmax(scores)] : first(path_ids)
+end
+
+"""
+    _profile_label(profile) -> String
+
+Render a profile vector with arrows for display.
+"""
+_profile_label(profile::AbstractVector{<:Real})::String = format_arrow(profile; digits=3)
+_profile_label(profile::AbstractVector{<:AbstractString})::String = join(profile, " -> ")
+
+"""
+    _should_include_behavior_path(ro_profile, feasible, volume, path_scope, min_volume_mean)
+        -> (Bool, Union{Nothing, String})
+
+Decide whether a path should be included in behavior-family grouping.
+"""
+function _should_include_behavior_path(
+    ro_profile::AbstractVector{<:Real},
+    feasible::Bool,
+    volume::Union{Nothing,Volume},
+    path_scope::Symbol,
+    min_volume_mean::Real,
+)::Tuple{Bool,Union{Nothing,String}}
+    isempty(ro_profile) && return (false, "empty_behavior_profile")
+
+    if path_scope == :all
+        return (true, nothing)
+    elseif !feasible
+        return (false, "empty_path_polyhedron")
+    elseif path_scope == :feasible
+        return (true, nothing)
+    elseif isnothing(volume)
+        return (false, "volume_not_computed")
+    elseif volume.mean < min_volume_mean
+        return (false, "volume_below_threshold")
+    else
+        return (true, nothing)
+    end
+end
+
+"""
+    get_behavior_families(grh::SISOPaths; observe_x, path_scope=:feasible,
+        min_volume_mean=0.0, deduplicate=true, keep_singular=true,
+        keep_nonasymptotic=false, motif_zero_tol=1e-6, compute_volume=true,
+        volume_kwargs...) -> NamedTuple
+
+Enumerate exact and motif behavior families for one SISO path bundle and one output species.
+
+`path_scope` controls which paths contribute to families:
+- `:all`: include every graph path, even if its path polyhedron is empty.
+- `:feasible`: include only paths with non-empty path polyhedra.
+- `:robust`: include only feasible paths whose estimated volume mean is at least
+  `min_volume_mean`.
+
+All paths are still reported in the returned diagnostics, along with explicit
+`included` / `exclusion_reason` fields, so filtering is never silent.
+"""
+function get_behavior_families(
+    grh::SISOPaths;
+    observe_x,
+    path_scope::Symbol=:feasible,
+    min_volume_mean::Real=0.0,
+    deduplicate::Bool=true,
+    keep_singular::Bool=true,
+    keep_nonasymptotic::Bool=false,
+    motif_zero_tol::Real=1e-6,
+    compute_volume::Bool=true,
+    volume_kwargs...,
+)
+    path_scope = _normalize_behavior_scope(path_scope)
+    path_scope == :robust && !compute_volume && error("path_scope=:robust requires compute_volume=true")
+
+    total_paths = length(grh.rgm_paths)
+    ord_paths = get_RO_paths(
+        grh;
+        observe_x=observe_x,
+        deduplicate=deduplicate,
+        keep_singular=keep_singular,
+        keep_nonasymptotic=keep_nonasymptotic,
+    )
+
+    polys = get_polyhedra(grh)
+    feasible_mask = map(poly -> !isempty(poly), polys)
+    feasible_ids = findall(feasible_mask)
+
+    volumes_by_path = Vector{Union{Nothing,Volume}}(undef, total_paths)
+    fill!(volumes_by_path, nothing)
+    if compute_volume && !isempty(feasible_ids)
+        vols = get_volumes(grh, feasible_ids; volume_kwargs...)
+        for (path_idx, vol) in zip(feasible_ids, vols)
+            volumes_by_path[path_idx] = vol
+        end
+    end
+
+    path_records = Vector{NamedTuple}(undef, total_paths)
+    exclusion_counts = Dict{String,Int}()
+    included_path_ids = Int[]
+
+    for path_idx in 1:total_paths
+        ord_profile = ord_paths[path_idx]
+        motif_profile = _motif_profile(ord_profile; zero_tol=motif_zero_tol)
+        feasible = feasible_mask[path_idx]
+        volume = volumes_by_path[path_idx]
+        included, exclusion_reason = _should_include_behavior_path(
+            ord_profile, feasible, volume, path_scope, min_volume_mean)
+
+        if included
+            push!(included_path_ids, path_idx)
+        elseif !isnothing(exclusion_reason)
+            exclusion_counts[exclusion_reason] = get(exclusion_counts, exclusion_reason, 0) + 1
+        end
+
+        path_records[path_idx] = (
+            path_idx=path_idx,
+            vertex_indices=copy(grh.rgm_paths[path_idx]),
+            exact_profile=ord_profile,
+            exact_label=_profile_label(ord_profile),
+            motif_profile=motif_profile,
+            motif_label=_motif_label(motif_profile),
+            feasible=feasible,
+            included=included,
+            exclusion_reason=exclusion_reason,
+            volume=volume,
+        )
+    end
+
+    exact_groups = Dict{Any,Vector{Int}}()
+    exact_to_motif = Dict{Any,Any}()
+    for path_idx in included_path_ids
+        exact_key = Tuple(path_records[path_idx].exact_profile)
+        motif_key = Tuple(path_records[path_idx].motif_profile)
+        push!(get!(exact_groups, exact_key, Int[]), path_idx)
+        exact_to_motif[exact_key] = motif_key
+    end
+
+    exact_families = NamedTuple[]
+    for (exact_key, path_ids) in exact_groups
+        profile = collect(exact_key)
+        motif_profile = collect(exact_to_motif[exact_key])
+        member_volumes = filter(!isnothing, getindex.(path_records[path_ids], :volume))
+        total_volume = _sum_volumes(member_volumes)
+        rep_path = if isempty(path_ids)
+            0
+        elseif isnothing(total_volume)
+            first(path_ids)
+        else
+            _representative_path_idx(path_ids, path_records)
+        end
+
+        push!(exact_families, (
+            family_idx=0,
+            exact_profile=profile,
+            exact_label=_profile_label(profile),
+            motif_profile=motif_profile,
+            motif_label=_motif_label(motif_profile),
+            path_indices=sort(path_ids),
+            n_paths=length(path_ids),
+            total_volume=total_volume,
+            representative_path_idx=rep_path,
+            representative_volume=rep_path == 0 ? nothing : path_records[rep_path].volume,
+        ))
+    end
+
+    sort!(exact_families; by=family -> isnothing(family.total_volume) ? family.n_paths : family.total_volume.mean, rev=true)
+    exact_families = [(; family..., family_idx=i) for (i, family) in enumerate(exact_families)]
+    exact_family_idx_by_key = Dict(Tuple(family.exact_profile) => family.family_idx for family in exact_families)
+
+    motif_groups = Dict{Any,Vector{Int}}()
+    motif_to_exact_keys = Dict{Any,Vector{Any}}()
+    for path_idx in included_path_ids
+        motif_key = Tuple(path_records[path_idx].motif_profile)
+        exact_key = Tuple(path_records[path_idx].exact_profile)
+        push!(get!(motif_groups, motif_key, Int[]), path_idx)
+        exact_keys = get!(motif_to_exact_keys, motif_key, Any[])
+        any(existing -> isequal(existing, exact_key), exact_keys) || push!(exact_keys, exact_key)
+    end
+
+    motif_families = NamedTuple[]
+    for (motif_key, path_ids) in motif_groups
+        motif_profile = collect(motif_key)
+        member_volumes = filter(!isnothing, getindex.(path_records[path_ids], :volume))
+        total_volume = _sum_volumes(member_volumes)
+        rep_path = if isempty(path_ids)
+            0
+        elseif isnothing(total_volume)
+            first(path_ids)
+        else
+            _representative_path_idx(path_ids, path_records)
+        end
+
+        push!(motif_families, (
+            family_idx=0,
+            motif_profile=motif_profile,
+            motif_label=_motif_label(motif_profile),
+            path_indices=sort(path_ids),
+            n_paths=length(path_ids),
+            exact_family_indices=sort([exact_family_idx_by_key[exact_key] for exact_key in motif_to_exact_keys[motif_key]]),
+            total_volume=total_volume,
+            representative_path_idx=rep_path,
+            representative_volume=rep_path == 0 ? nothing : path_records[rep_path].volume,
+        ))
+    end
+
+    sort!(motif_families; by=family -> isnothing(family.total_volume) ? family.n_paths : family.total_volume.mean, rev=true)
+    motif_families = [(; family..., family_idx=i) for (i, family) in enumerate(motif_families)]
+
+    return (
+        change_qK_idx=grh.change_qK_idx,
+        observe_x_idx=locate_sym_x(grh.bn, observe_x),
+        path_scope=path_scope,
+        min_volume_mean=Float64(min_volume_mean),
+        deduplicate=deduplicate,
+        keep_singular=keep_singular,
+        keep_nonasymptotic=keep_nonasymptotic,
+        compute_volume=compute_volume,
+        total_paths=total_paths,
+        feasible_paths=count(feasible_mask),
+        included_paths=length(included_path_ids),
+        excluded_paths=total_paths - length(included_path_ids),
+        exclusion_counts=exclusion_counts,
+        path_records=path_records,
+        exact_families=exact_families,
+        motif_families=motif_families,
+    )
+end
+
+"""
+    get_behavior_families(model::Bnc, change_qK; kwargs...) -> NamedTuple
+
+Convenience wrapper that constructs `SISOPaths` first.
+"""
+get_behavior_families(model::Bnc, change_qK; kwargs...) = get_behavior_families(SISOPaths(model, change_qK); kwargs...)
+
+"""
+    summary_behavior_families(grh::SISOPaths; observe_x, level=:exact, kwargs...) -> nothing
+
+Print exact or motif behavior families.
+"""
+function summary_behavior_families(
+    grh::SISOPaths;
+    observe_x,
+    level::Symbol=:exact,
+    kwargs...,
+)
+    result = get_behavior_families(grh; observe_x=observe_x, kwargs...)
+    if level == :exact
+        print_paths(
+            getindex.(result.exact_families, :exact_profile);
+            prefix="",
+            ids=getindex.(result.exact_families, :family_idx),
+            volumes=getindex.(result.exact_families, :total_volume),
+        )
+    elseif level == :motif
+        for family in result.motif_families
+            volume_str = isnothing(family.total_volume) ? "n/a" :
+                Printf.@sprintf("%.4f ± %.4f", family.total_volume.mean, sqrt(family.total_volume.var))
+            println("Motif $(family.family_idx): $(_profile_label(family.motif_profile))  Label=$(family.motif_label)  Volume=$(volume_str)")
+        end
+    else
+        error("Unsupported level=$level. Use :exact or :motif.")
+    end
+    return nothing
+end
+
+
 #-----------------------------------------------------------------
 # ROP Polyhedron functions
 #-----------------------------------------------------------------
@@ -1281,4 +1663,3 @@ function compute_rop_polyhedron(model::Bnc, output_coeffs::Vector{Float64},
         "edges" => edges,
     )
 end
-

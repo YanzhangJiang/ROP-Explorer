@@ -177,6 +177,30 @@ const NODE_TYPES = {
           <select id="${nodeId}-siso-select" class="auto-update"></select>
         </div>
         <div class="param-row">
+          <label>Target x:</label>
+          <select id="${nodeId}-target-x" class="auto-update"></select>
+        </div>
+        <div class="param-row">
+          <label>Path scope:</label>
+          <select id="${nodeId}-path-scope" class="auto-update">
+            <option value="feasible">feasible</option>
+            <option value="all">all graph paths</option>
+            <option value="robust">robust</option>
+          </select>
+        </div>
+        <div class="param-row">
+          <label>Min volume:</label>
+          <input type="number" id="${nodeId}-min-volume" value="0" min="0" step="0.01" class="auto-update">
+        </div>
+        <div class="param-row">
+          <label>Keep singular:</label>
+          <input type="checkbox" id="${nodeId}-keep-singular" checked class="auto-update">
+        </div>
+        <div class="param-row">
+          <label>Keep non-asym:</label>
+          <input type="checkbox" id="${nodeId}-keep-nonasym" class="auto-update">
+        </div>
+        <div class="param-row">
           <label>Min (log10):</label>
           <input type="number" id="${nodeId}-min" value="-6" min="-20" max="20" step="0.5" class="auto-update">
         </div>
@@ -190,7 +214,7 @@ const NODE_TYPES = {
       setupAutoUpdate(nodeId, 'siso-params');
     },
     async execute(nodeId) {
-      // Populate the select with qK symbols
+      // Populate the selects
       const sel = document.getElementById(`${nodeId}-siso-select`);
       if (sel && state.qK_syms.length > 0) {
         const curVal = sel.value;
@@ -204,12 +228,30 @@ const NODE_TYPES = {
         else sel.value = state.qK_syms[0];
       }
 
+      const targetSel = document.getElementById(`${nodeId}-target-x`);
+      if (targetSel && state.model?.x_sym?.length > 0) {
+        const curVal = targetSel.value;
+        targetSel.innerHTML = '';
+        state.model.x_sym.forEach(s => {
+          const opt = document.createElement('option');
+          opt.value = s; opt.textContent = s;
+          targetSel.appendChild(opt);
+        });
+        if (curVal && state.model.x_sym.includes(curVal)) targetSel.value = curVal;
+        else targetSel.value = state.model.x_sym[0];
+      }
+
       // Store config in node data
       const info = nodeRegistry[nodeId];
       if (info) {
         info.data = info.data || {};
         info.data.config = {
           change_qK: sel ? sel.value : state.qK_syms[0],
+          observe_x: targetSel ? targetSel.value : state.model?.x_sym?.[0],
+          path_scope: document.getElementById(`${nodeId}-path-scope`)?.value || 'feasible',
+          min_volume_mean: parseFloat(document.getElementById(`${nodeId}-min-volume`)?.value || '0'),
+          keep_singular: document.getElementById(`${nodeId}-keep-singular`)?.checked ?? true,
+          keep_nonasymptotic: document.getElementById(`${nodeId}-keep-nonasym`)?.checked ?? false,
           min: parseFloat(document.getElementById(`${nodeId}-min`)?.value || '-6'),
           max: parseFloat(document.getElementById(`${nodeId}-max`)?.value || '6')
         };
@@ -219,15 +261,32 @@ const NODE_TYPES = {
   'siso-result': {
     category: 'result',
     headerClass: 'header-result',
-    title: 'SISO Result',
+    title: 'SISO Behaviors',
     inputs: [{ port: 'params', label: 'Params' }],
-    outputs: [],
+    outputs: [{ port: 'result', label: 'Path' }],
     defaultWidth: 420,
     createBody(nodeId) {
       return `
         <button class="btn btn-small" onclick="computeSISOResult('${nodeId}')">Run</button>
-        <div class="viewer-content" id="${nodeId}-content"><span class="text-dim">Click Run to compute SISO analysis</span></div>
+        <div class="viewer-content" id="${nodeId}-content"><span class="text-dim">Click Run to enumerate behavior families</span></div>
       `;
+    },
+  },
+  'qk-poly-result': {
+    category: 'result',
+    headerClass: 'header-result',
+    title: 'qK-space Polyhedron',
+    inputs: [{ port: 'result', label: 'Path' }],
+    outputs: [],
+    defaultWidth: 420,
+    createBody(nodeId) {
+      return `
+        <button class="btn btn-small" onclick="executeQKPolyResult('${nodeId}')">Compute</button>
+        <div class="viewer-content" id="${nodeId}-content"><span class="text-dim">Connect to a SISO Behaviors node and select a path.</span></div>
+      `;
+    },
+    async execute(nodeId) {
+      await executeQKPolyResult(nodeId);
     },
   },
   'siso-analysis': {
@@ -459,15 +518,9 @@ const NODE_TYPES = {
 
       const paramSelect = document.getElementById(`${nodeId}-param`);
       const speciesHelper = document.getElementById(`${nodeId}-species-helper`);
-
-      if (paramSelect.options.length === 0) {
-        state.model.q_sym.forEach(s => paramSelect.add(new Option(s, s)));
-        state.model.K_sym.forEach(s => paramSelect.add(new Option(s, s)));
-      }
-
-      if (speciesHelper.options.length === 1) {
-        state.model.x_sym.forEach(s => speciesHelper.add(new Option(s, s)));
-      }
+      const qkSymbols = [...state.model.q_sym, ...state.model.K_sym];
+      syncSelectOptions(paramSelect, qkSymbols);
+      syncSelectOptions(speciesHelper, [''].concat(state.model.x_sym), '', 0);
     },
   },
   'parameter-scan-2d': {
@@ -524,21 +577,10 @@ const NODE_TYPES = {
       const param1Select = document.getElementById(`${nodeId}-param1`);
       const param2Select = document.getElementById(`${nodeId}-param2`);
       const speciesHelper = document.getElementById(`${nodeId}-species-helper`);
-
-      if (param1Select.options.length === 0) {
-        [...state.model.q_sym, ...state.model.K_sym].forEach(s => {
-          param1Select.add(new Option(s, s));
-          param2Select.add(new Option(s, s));
-        });
-        if (state.model.q_sym.length >= 2) {
-          param1Select.value = state.model.q_sym[0];
-          param2Select.value = state.model.q_sym[1];
-        }
-      }
-
-      if (speciesHelper.options.length === 1) {
-        state.model.x_sym.forEach(s => speciesHelper.add(new Option(s, s)));
-      }
+      const qkSymbols = [...state.model.q_sym, ...state.model.K_sym];
+      syncSelectOptions(param1Select, qkSymbols, param1Select?.value, 0);
+      syncSelectOptions(param2Select, qkSymbols, param2Select?.value, 1);
+      syncSelectOptions(speciesHelper, [''].concat(state.model.x_sym), '', 0);
     },
   },
   'rop-polyhedron': {
@@ -551,28 +593,46 @@ const NODE_TYPES = {
     createBody(nodeId) {
       return `
         <div class="param-row">
-          <label>Output expression:</label>
-          <div style="display:flex;gap:4px;">
-            <input type="text" id="${nodeId}-expr" placeholder="e.g., C_ES or 2*C_ES+E" style="flex:1;">
-            <select id="${nodeId}-species-helper" onchange="insertSpeciesPoly('${nodeId}')" style="width:80px;">
-              <option value="">Insert...</option>
-            </select>
-          </div>
+          <label>View:</label>
+          <select id="${nodeId}-dimension" onchange="updateROPPolyDimension('${nodeId}')">
+            <option value="2">2D</option>
+            <option value="3">3D</option>
+          </select>
         </div>
         <div class="param-row">
-          <label>X-axis parameter:</label>
-          <select id="${nodeId}-param1"></select>
+          <label>Axis 1 x:</label>
+          <select id="${nodeId}-x1"></select>
         </div>
         <div class="param-row">
-          <label>Y-axis parameter:</label>
-          <select id="${nodeId}-param2"></select>
+          <label>Axis 1 qK:</label>
+          <select id="${nodeId}-qk1"></select>
         </div>
         <div class="param-row">
-          <label><input type="checkbox" id="${nodeId}-asymptotic" checked> Asymptotic only</label>
+          <label>Axis 2 x:</label>
+          <select id="${nodeId}-x2"></select>
         </div>
         <div class="param-row">
-          <label>Max vertices:</label>
-          <input type="number" id="${nodeId}-max-vertices" value="1000" min="10" max="5000">
+          <label>Axis 2 qK:</label>
+          <select id="${nodeId}-qk2"></select>
+        </div>
+        <div class="param-row" id="${nodeId}-axis3-x-row" style="display:none;">
+          <label>Axis 3 x:</label>
+          <select id="${nodeId}-x3"></select>
+        </div>
+        <div class="param-row" id="${nodeId}-axis3-qk-row" style="display:none;">
+          <label>Axis 3 qK:</label>
+          <select id="${nodeId}-qk3"></select>
+        </div>
+        <div class="param-row">
+          <label><input type="checkbox" id="${nodeId}-add-inner-points" checked> Add inner points</label>
+        </div>
+        <div class="param-row">
+          <label>Inner samples:</label>
+          <input type="number" id="${nodeId}-npoints" value="5000" min="0" max="100000" step="500">
+        </div>
+        <div class="param-row">
+          <label>Ray extend:</label>
+          <input type="number" id="${nodeId}-singular-extends" value="2" min="0.1" max="20" step="0.1">
         </div>
         <button class="btn btn-primary" onclick="runROPPolyhedron('${nodeId}')">Compute Polyhedron</button>
         <div class="viewer-content" id="${nodeId}-content">
@@ -582,25 +642,42 @@ const NODE_TYPES = {
     },
     async execute(nodeId) {
       if (!state.model) return;
+      const savedConfig = nodeRegistry[nodeId]?.data?.config || nodeRegistry[nodeId]?.data || {};
+      const xSelects = ['x1', 'x2', 'x3'].map(id => document.getElementById(`${nodeId}-${id}`)).filter(Boolean);
+      const qkSelects = ['qk1', 'qk2', 'qk3'].map(id => document.getElementById(`${nodeId}-${id}`)).filter(Boolean);
+      const qkSymbols = [...state.model.q_sym, ...state.model.K_sym];
+      const defaultX = state.model.x_sym[0] || '';
+      const defaultQK = qkSymbols[0] || '';
 
-      const param1Select = document.getElementById(`${nodeId}-param1`);
-      const param2Select = document.getElementById(`${nodeId}-param2`);
-      const speciesHelper = document.getElementById(`${nodeId}-species-helper`);
+      xSelects.forEach((sel, idx) => {
+        const preferred = savedConfig.pairs?.[idx]?.x_symbol || sel.value;
+        syncSelectOptions(sel, state.model.x_sym, preferred, idx);
+        if (!sel.value) sel.value = state.model.x_sym[idx] || defaultX;
+      });
 
-      if (param1Select.options.length === 0) {
-        [...state.model.q_sym, ...state.model.K_sym].forEach(s => {
-          param1Select.add(new Option(s, s));
-          param2Select.add(new Option(s, s));
-        });
-        if (state.model.q_sym.length >= 2) {
-          param1Select.value = state.model.q_sym[0];
-          param2Select.value = state.model.q_sym[1];
-        }
+      qkSelects.forEach((sel, idx) => {
+        const preferred = savedConfig.pairs?.[idx]?.qk_symbol || sel.value;
+        syncSelectOptions(sel, qkSymbols, preferred, idx);
+        if (!sel.value) sel.value = qkSymbols[idx] || defaultQK;
+      });
+
+      if (savedConfig.dimension != null) {
+        const dimensionEl = document.getElementById(`${nodeId}-dimension`);
+        if (dimensionEl) dimensionEl.value = savedConfig.dimension;
       }
-
-      if (speciesHelper.options.length === 1) {
-        state.model.x_sym.forEach(s => speciesHelper.add(new Option(s, s)));
-      }
+      (savedConfig.pairs || []).forEach((pair, idx) => {
+        const xEl = xSelects[idx];
+        const qkEl = qkSelects[idx];
+        if (xEl && pair.x_symbol && Array.from(xEl.options).some(opt => opt.value === pair.x_symbol)) xEl.value = pair.x_symbol;
+        if (qkEl && pair.qk_symbol && Array.from(qkEl.options).some(opt => opt.value === pair.qk_symbol)) qkEl.value = pair.qk_symbol;
+      });
+      const addInnerEl = document.getElementById(`${nodeId}-add-inner-points`);
+      const npointsEl = document.getElementById(`${nodeId}-npoints`);
+      const singularExtendsEl = document.getElementById(`${nodeId}-singular-extends`);
+      if (addInnerEl && savedConfig.add_inner_points != null) addInnerEl.checked = savedConfig.add_inner_points;
+      if (npointsEl && savedConfig.npoints != null) npointsEl.value = savedConfig.npoints;
+      if (singularExtendsEl && savedConfig.singular_extends != null) singularExtendsEl.value = savedConfig.singular_extends;
+      updateROPPolyDimension(nodeId);
     },
   },
   'scan-1d-params': {
@@ -647,17 +724,10 @@ const NODE_TYPES = {
 
       const paramSelect = document.getElementById(`${nodeId}-param`);
       const speciesHelper = document.getElementById(`${nodeId}-species-helper`);
-
-      if (paramSelect.options.length === 0) {
-        state.model.q_sym.forEach(s => paramSelect.add(new Option(s, s)));
-        state.model.K_sym.forEach(s => paramSelect.add(new Option(s, s)));
-        // Save config after populating select
-        triggerConfigUpdate(nodeId, 'scan-1d-params');
-      }
-
-      if (speciesHelper.options.length === 1) {
-        state.model.x_sym.forEach(s => speciesHelper.add(new Option(s, s)));
-      }
+      const qkSymbols = [...state.model.q_sym, ...state.model.K_sym];
+      syncSelectOptions(paramSelect, qkSymbols);
+      syncSelectOptions(speciesHelper, [''].concat(state.model.x_sym), '', 0);
+      triggerConfigUpdate(nodeId, 'scan-1d-params');
     },
   },
   'scan-1d-result': {
@@ -873,25 +943,11 @@ const NODE_TYPES = {
       const param1Select = document.getElementById(`${nodeId}-param1`);
       const param2Select = document.getElementById(`${nodeId}-param2`);
       const speciesHelper = document.getElementById(`${nodeId}-species-helper`);
-      if (param1Select.options.length === 0) {
-        state.model.q_sym.forEach(s => {
-          param1Select.add(new Option(s, s));
-          param2Select.add(new Option(s, s));
-        });
-        state.model.K_sym.forEach(s => {
-          param1Select.add(new Option(s, s));
-          param2Select.add(new Option(s, s));
-        });
-        if (state.model.q_sym.length >= 2) {
-          param1Select.value = state.model.q_sym[0];
-          param2Select.value = state.model.q_sym[1];
-        }
-        // Save config after populating selects
-        triggerConfigUpdate(nodeId, 'scan-2d-params');
-      }
-      if (speciesHelper.options.length === 1) {
-        state.model.x_sym.forEach(s => speciesHelper.add(new Option(s, s)));
-      }
+      const qkSymbols = [...state.model.q_sym, ...state.model.K_sym];
+      syncSelectOptions(param1Select, qkSymbols, param1Select?.value, 0);
+      syncSelectOptions(param2Select, qkSymbols, param2Select?.value, 1);
+      syncSelectOptions(speciesHelper, [''].concat(state.model.x_sym), '', 0);
+      triggerConfigUpdate(nodeId, 'scan-2d-params');
     },
   },
   'scan-2d-result': {
@@ -923,28 +979,46 @@ const NODE_TYPES = {
     createBody(nodeId) {
       return `
         <div class="param-row">
-          <label>Output expression:</label>
-          <div style="display:flex;gap:4px;">
-            <input type="text" id="${nodeId}-expr" placeholder="e.g., C_ES or 2*C_ES+E" style="flex:1;" class="auto-update">
-            <select id="${nodeId}-species-helper" onchange="insertSpeciesPoly('${nodeId}')" style="width:80px;">
-              <option value="">Insert...</option>
-            </select>
-          </div>
+          <label>View:</label>
+          <select id="${nodeId}-dimension" class="auto-update" onchange="updateROPPolyDimension('${nodeId}')">
+            <option value="2">2D</option>
+            <option value="3">3D</option>
+          </select>
         </div>
         <div class="param-row">
-          <label>X-axis parameter:</label>
-          <select id="${nodeId}-param1" class="auto-update"></select>
+          <label>Axis 1 x:</label>
+          <select id="${nodeId}-x1" class="auto-update"></select>
         </div>
         <div class="param-row">
-          <label>Y-axis parameter:</label>
-          <select id="${nodeId}-param2" class="auto-update"></select>
+          <label>Axis 1 qK:</label>
+          <select id="${nodeId}-qk1" class="auto-update"></select>
         </div>
         <div class="param-row">
-          <label><input type="checkbox" id="${nodeId}-asymptotic" checked class="auto-update"> Asymptotic only</label>
+          <label>Axis 2 x:</label>
+          <select id="${nodeId}-x2" class="auto-update"></select>
         </div>
         <div class="param-row">
-          <label>Max vertices:</label>
-          <input type="number" id="${nodeId}-max-vertices" value="1000" min="10" max="5000" class="auto-update">
+          <label>Axis 2 qK:</label>
+          <select id="${nodeId}-qk2" class="auto-update"></select>
+        </div>
+        <div class="param-row" id="${nodeId}-axis3-x-row" style="display:none;">
+          <label>Axis 3 x:</label>
+          <select id="${nodeId}-x3" class="auto-update"></select>
+        </div>
+        <div class="param-row" id="${nodeId}-axis3-qk-row" style="display:none;">
+          <label>Axis 3 qK:</label>
+          <select id="${nodeId}-qk3" class="auto-update"></select>
+        </div>
+        <div class="param-row">
+          <label><input type="checkbox" id="${nodeId}-add-inner-points" checked class="auto-update"> Add inner points</label>
+        </div>
+        <div class="param-row">
+          <label>Inner samples:</label>
+          <input type="number" id="${nodeId}-npoints" value="5000" min="0" max="100000" step="500" class="auto-update">
+        </div>
+        <div class="param-row">
+          <label>Ray extend:</label>
+          <input type="number" id="${nodeId}-singular-extends" value="2" min="0.1" max="20" step="0.1" class="auto-update">
         </div>
       `;
     },
@@ -953,22 +1027,38 @@ const NODE_TYPES = {
     },
     async execute(nodeId) {
       if (!state.model) return;
-      const param1Select = document.getElementById(`${nodeId}-param1`);
-      const param2Select = document.getElementById(`${nodeId}-param2`);
-      const speciesHelper = document.getElementById(`${nodeId}-species-helper`);
-      if (param1Select.options.length === 0) {
-        [...state.model.q_sym, ...state.model.K_sym].forEach(s => {
-          param1Select.add(new Option(s, s));
-          param2Select.add(new Option(s, s));
-        });
-        if (state.model.q_sym.length >= 2) {
-          param1Select.value = state.model.q_sym[0];
-          param2Select.value = state.model.q_sym[1];
-        }
+      const savedConfig = nodeRegistry[nodeId]?.data?.config || {};
+      const xSelects = ['x1', 'x2', 'x3'].map(id => document.getElementById(`${nodeId}-${id}`)).filter(Boolean);
+      const qkSelects = ['qk1', 'qk2', 'qk3'].map(id => document.getElementById(`${nodeId}-${id}`)).filter(Boolean);
+      const qkSymbols = [...state.model.q_sym, ...state.model.K_sym];
+      const defaultX = state.model.x_sym[0] || '';
+      const defaultQK = qkSymbols[0] || '';
+
+      xSelects.forEach((sel, idx) => {
+        const preferred = savedConfig.pairs?.[idx]?.x_symbol || sel.value;
+        syncSelectOptions(sel, state.model.x_sym, preferred, idx);
+        if (!sel.value) sel.value = state.model.x_sym[idx] || defaultX;
+      });
+
+      qkSelects.forEach((sel, idx) => {
+        const preferred = savedConfig.pairs?.[idx]?.qk_symbol || sel.value;
+        syncSelectOptions(sel, qkSymbols, preferred, idx);
+        if (!sel.value) sel.value = qkSymbols[idx] || defaultQK;
+      });
+
+      if (savedConfig.dimension != null) {
+        const dimensionEl = document.getElementById(`${nodeId}-dimension`);
+        if (dimensionEl) dimensionEl.value = savedConfig.dimension;
       }
-      if (speciesHelper.options.length === 1) {
-        state.model.x_sym.forEach(s => speciesHelper.add(new Option(s, s)));
-      }
+      (savedConfig.pairs || []).forEach((pair, idx) => {
+        const xEl = xSelects[idx];
+        const qkEl = qkSelects[idx];
+        if (xEl && pair.x_symbol && Array.from(xEl.options).some(opt => opt.value === pair.x_symbol)) xEl.value = pair.x_symbol;
+        if (qkEl && pair.qk_symbol && Array.from(qkEl.options).some(opt => opt.value === pair.qk_symbol)) qkEl.value = pair.qk_symbol;
+      });
+
+      updateROPPolyDimension(nodeId);
+      triggerConfigUpdate(nodeId, 'rop-poly-params');
     },
   },
   'rop-poly-result': {
@@ -1001,11 +1091,12 @@ const PREREQ_CHAIN = {
   'siso-analysis': ['reaction-network', 'model-builder'],
   'siso-params': ['reaction-network', 'model-builder'],
   'siso-result': ['siso-params'],
+  'qk-poly-result': ['siso-result'],
   'rop-cloud': ['reaction-network'],
   'fret-heatmap': ['reaction-network', 'model-builder'],
   'parameter-scan-1d': ['reaction-network', 'model-builder'],
   'parameter-scan-2d': ['reaction-network', 'model-builder'],
-  'rop-polyhedron': ['reaction-network', 'model-builder'],
+  'rop-polyhedron': ['model-builder'],
   'scan-1d-params': ['reaction-network', 'model-builder'],
   'scan-1d-result': ['scan-1d-params'],
   'rop-cloud-params': ['reaction-network'],
@@ -1014,7 +1105,7 @@ const PREREQ_CHAIN = {
   'fret-result': ['fret-params'],
   'scan-2d-params': ['reaction-network', 'model-builder'],
   'scan-2d-result': ['scan-2d-params'],
-  'rop-poly-params': ['reaction-network', 'model-builder'],
+  'rop-poly-params': ['model-builder'],
   'rop-poly-result': ['rop-poly-params'],
 };
 
@@ -1039,6 +1130,18 @@ function applyViewportTransform() {
   editor.style.backgroundSize = `${50 * scale}px ${50 * scale}px`;
 }
 
+function findScrollableAncestor(target, stopAt = editor) {
+  let el = target instanceof Element ? target : null;
+  while (el && el !== stopAt) {
+    const style = window.getComputedStyle(el);
+    const canScrollY = ['auto', 'scroll'].includes(style.overflowY) && el.scrollHeight > el.clientHeight + 1;
+    const canScrollX = ['auto', 'scroll'].includes(style.overflowX) && el.scrollWidth > el.clientWidth + 1;
+    if (canScrollY || canScrollX) return el;
+    el = el.parentElement;
+  }
+  return null;
+}
+
 // Canvas panning (middle/right mouse button, or left-click on blank area)
 editor.addEventListener('mousedown', (e) => {
   if (e.button === 1 || e.button === 2) {
@@ -1056,6 +1159,10 @@ editor.addEventListener('mousedown', (e) => {
 
 // Wheel / trackpad panning and zooming
 editor.addEventListener('wheel', (e) => {
+  if (!(e.ctrlKey || e.metaKey) && findScrollableAncestor(e.target)) {
+    return;
+  }
+
   e.preventDefault();
 
   if (e.ctrlKey || e.metaKey) {
@@ -1803,9 +1910,8 @@ async function buildModel(modelBuilderNodeId) {
 }
 
 // ===== Downstream Viewer Auto-Execution =====
-async function onModelBuilt(modelBuilderNodeId) {
-  const downstream = connections.filter(c => c.fromNode === modelBuilderNodeId && c.fromPort === 'model');
-
+function triggerDownstreamNodes(fromNodeId, fromPort) {
+  const downstream = connections.filter(c => c.fromNode === fromNodeId && c.fromPort === fromPort);
   for (const conn of downstream) {
     const viewerInfo = nodeRegistry[conn.toNode];
     if (!viewerInfo) continue;
@@ -1829,10 +1935,308 @@ async function onModelBuilt(modelBuilderNodeId) {
   }
 }
 
+async function onModelBuilt(modelBuilderNodeId) {
+  triggerDownstreamNodes(modelBuilderNodeId, 'model');
+}
+
+function syncSelectOptions(selectEl, values, preferredValue = null, fallbackIndex = 0) {
+  if (!selectEl) return;
+  const orderedValues = Array.isArray(values) ? values.filter(v => v != null && v !== '') : [];
+  const previousValue = preferredValue ?? selectEl.value;
+  selectEl.innerHTML = '';
+  orderedValues.forEach(value => selectEl.add(new Option(value, value)));
+  if (!orderedValues.length) return;
+  if (previousValue && orderedValues.includes(previousValue)) {
+    selectEl.value = previousValue;
+    return;
+  }
+  const safeIndex = Math.min(Math.max(fallbackIndex, 0), orderedValues.length - 1);
+  selectEl.value = orderedValues[safeIndex];
+}
+
 // ===== Recompute Functions =====
 function recomputeSISO(nodeId) {
   const typeDef = NODE_TYPES['siso-analysis'];
   if (typeDef.execute) typeDef.execute(nodeId);
+}
+
+function formatVolumeSummary(vol) {
+  if (!vol || vol.mean == null) return 'n/a';
+  const mean = Number(vol.mean);
+  const std = Number(vol.std ?? Math.sqrt(vol.var ?? 0));
+  if (!Number.isFinite(mean)) return 'n/a';
+  if (!Number.isFinite(std)) return mean.toExponential(2);
+  return `${mean.toExponential(2)} ± ${std.toExponential(1)}`;
+}
+
+function renderExclusionCounts(exclusionCounts) {
+  const entries = Object.entries(exclusionCounts || {});
+  if (!entries.length) return '';
+  const items = entries.map(([reason, count]) => `<span class="tag tag-nonasym">${reason}: ${count}</span>`).join(' ');
+  return `<div class="siso-inline-tags"><strong>Excluded paths</strong>: ${items}</div>`;
+}
+
+const SISO_FAMILY_COLORS = ['#ff8c42', '#2ec4b6', '#f94144', '#577590', '#f9c74f', '#8d99ae', '#90be6d', '#c77dff', '#4cc9f0', '#fb6f92'];
+
+function hexToRgba(hex, alpha) {
+  const clean = (hex || '#888888').replace('#', '');
+  const value = clean.length === 3
+    ? clean.split('').map(ch => ch + ch).join('')
+    : clean;
+  const intVal = parseInt(value, 16);
+  const r = (intVal >> 16) & 255;
+  const g = (intVal >> 8) & 255;
+  const b = intVal & 255;
+  return `rgba(${r}, ${g}, ${b}, ${alpha})`;
+}
+
+function getFamilyColor(index, offset = 0) {
+  const safeIndex = Math.max(1, Number(index) || 1);
+  return SISO_FAMILY_COLORS[(safeIndex - 1 + offset) % SISO_FAMILY_COLORS.length];
+}
+
+function buildPathFamilyMaps(data) {
+  const exactFamilyByPath = new Map();
+  const motifFamilyByPath = new Map();
+
+  (data.exact_families || []).forEach(family => {
+    (family.path_indices || []).forEach(pathIdx => exactFamilyByPath.set(pathIdx, family.family_idx));
+  });
+  (data.motif_families || []).forEach(family => {
+    (family.path_indices || []).forEach(pathIdx => motifFamilyByPath.set(pathIdx, family.family_idx));
+  });
+
+  return { exactFamilyByPath, motifFamilyByPath };
+}
+
+function buildSISOSelection(nodeId, changeQK, pathIdx) {
+  const nodeData = nodeRegistry[nodeId]?.data;
+  const behaviorData = nodeData?.behaviorData;
+  if (!behaviorData) return null;
+
+  const path = (behaviorData.paths || []).find(p => p.path_idx === pathIdx);
+  if (!path) return null;
+
+  const { exactFamilyByPath, motifFamilyByPath } = buildPathFamilyMaps(behaviorData);
+  return {
+    path_idx: pathIdx,
+    change_qK: behaviorData.change_qK || changeQK,
+    observe_x: behaviorData.observe_x,
+    exact_family_idx: exactFamilyByPath.get(pathIdx) || null,
+    motif_family_idx: motifFamilyByPath.get(pathIdx) || null,
+    exact_label: path.exact_label,
+    motif_label: path.motif_label,
+    feasible: path.feasible,
+    included: path.included,
+    vertex_indices: path.vertex_indices,
+    perms: path.perms,
+  };
+}
+
+function setSISOSelection(nodeId, changeQK, pathIdx) {
+  const nodeData = nodeRegistry[nodeId]?.data;
+  if (!nodeData) return null;
+  const selection = buildSISOSelection(nodeId, changeQK, pathIdx);
+  if (!selection) return null;
+  nodeData.selectedPath = selection;
+  triggerDownstreamNodes(nodeId, 'result');
+  return selection;
+}
+
+function clearSISOSelection(nodeId, notify = true) {
+  const nodeData = nodeRegistry[nodeId]?.data;
+  if (!nodeData) return;
+  nodeData.selectedPath = null;
+  if (notify) triggerDownstreamNodes(nodeId, 'result');
+}
+
+function renderPathChips(nodeId, changeQK, pathIndices, accent) {
+  return (pathIndices || []).map(pathIdx => `
+    <button
+      type="button"
+      class="path-chip"
+      data-path-idx="${pathIdx}"
+      style="--path-chip-accent:${accent}; --path-chip-soft:${hexToRgba(accent, 0.16)};"
+      onclick="plotSISOPath('${nodeId}', '${changeQK}', ${pathIdx}, this)"
+    >#${pathIdx}</button>
+  `).join('');
+}
+
+function renderFamilyRefs(indices, kind) {
+  if (!indices || !indices.length) return '<span class="text-dim">n/a</span>';
+  return indices.map(idx => `<span class="family-ref family-ref-${kind}">${kind === 'exact' ? 'E' : 'M'}${idx}</span>`).join('');
+}
+
+function renderFamilyTable(nodeId, changeQK, families, kind) {
+  if (!families.length) return '';
+
+  const rows = families.map(family => {
+    const accent = getFamilyColor(family.family_idx, kind === 'motif' ? 4 : 0);
+    const badgeStyle = `--badge-accent:${accent}; --badge-soft:${hexToRgba(accent, 0.18)};`;
+    const profile = kind === 'motif'
+      ? family.motif_profile.join(' → ')
+      : family.exact_label;
+    const extraCell = kind === 'motif'
+      ? `<td>${renderFamilyRefs(family.exact_family_indices, 'exact')}</td>`
+      : `<td>${family.motif_label}</td>`;
+
+    return `
+      <tr>
+        <td><span class="family-badge family-badge-${kind}" style="${badgeStyle}">${kind === 'motif' ? 'M' : 'E'}${family.family_idx}</span></td>
+        <td class="siso-profile-cell">${profile}</td>
+        ${extraCell}
+        <td>
+          <div class="family-path-chips">
+            ${renderPathChips(nodeId, changeQK, family.path_indices, accent)}
+          </div>
+        </td>
+        <td>${formatVolumeSummary(family.total_volume)}</td>
+        <td>${family.representative_path_idx
+          ? `<button type="button" class="btn btn-small siso-inline-btn" onclick="plotSISOPath('${nodeId}', '${changeQK}', ${family.representative_path_idx})">Plot</button>`
+          : '<span class="text-dim">n/a</span>'}</td>
+      </tr>
+    `;
+  }).join('');
+
+  const headerRow = kind === 'motif'
+    ? '<tr><th>#</th><th>Motif</th><th>Exact</th><th>Paths</th><th>Volume</th><th>Rep</th></tr>'
+    : '<tr><th>#</th><th>RO profile</th><th>Motif</th><th>Paths</th><th>Volume</th><th>Rep</th></tr>';
+
+  return `
+    <section class="siso-section">
+      <div class="siso-section-head">
+        <div class="siso-section-title">${kind === 'motif' ? 'Motif Families' : 'Exact Families'}</div>
+        <div class="text-dim">${families.length} families</div>
+      </div>
+      <div class="siso-table-wrap scroll-panel">
+        <table class="siso-family-table">
+          <thead>${headerRow}</thead>
+          <tbody>${rows}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+}
+
+function renderBehaviorFamiliesResult(nodeId, changeQK, data) {
+  const { exactFamilyByPath, motifFamilyByPath } = buildPathFamilyMaps(data);
+  const feasiblePaths = (data.paths || [])
+    .filter(path => path.feasible)
+    .sort((a, b) => {
+      const exactA = exactFamilyByPath.get(a.path_idx) || Number.MAX_SAFE_INTEGER;
+      const exactB = exactFamilyByPath.get(b.path_idx) || Number.MAX_SAFE_INTEGER;
+      const motifA = motifFamilyByPath.get(a.path_idx) || Number.MAX_SAFE_INTEGER;
+      const motifB = motifFamilyByPath.get(b.path_idx) || Number.MAX_SAFE_INTEGER;
+      return exactA - exactB || motifA - motifB || a.path_idx - b.path_idx;
+    });
+  const includedFeasiblePaths = feasiblePaths.filter(path => path.included);
+
+  let html = `
+    <div class="siso-summary-line">
+      <span class="summary-chip"><strong>${data.exact_families.length}</strong> exact families</span>
+      <span class="summary-chip"><strong>${data.motif_families.length}</strong> motif families</span>
+      <span class="summary-chip"><strong>${data.feasible_paths}</strong> feasible paths</span>
+      <span class="summary-chip"><strong>${data.included_paths}</strong> included paths</span>
+    </div>
+    <div class="siso-legend">
+      <span class="family-badge family-badge-exact">Exact family color</span>
+      <span class="family-badge family-badge-motif">Motif family color</span>
+      <span class="text-dim">Path cards reuse the same colors so you can trace one family across the whole result.</span>
+    </div>
+    <div class="siso-scope-note">${data.scope_note}</div>
+    ${renderExclusionCounts(data.exclusion_counts)}
+  `;
+
+  html += renderFamilyTable(nodeId, changeQK, data.motif_families || [], 'motif');
+  html += renderFamilyTable(nodeId, changeQK, data.exact_families || [], 'exact');
+
+  html += `
+    <section class="siso-section">
+      <div class="siso-section-head">
+        <div class="siso-section-title">Feasible Paths</div>
+        <div class="text-dim">Sorted by exact family, then motif family</div>
+      </div>
+      <div class="path-list siso-feasible-list scroll-panel">
+  `;
+
+  feasiblePaths.forEach(path => {
+    const permStr = path.perms.map(pr => `[${pr.join(',')}]`).join(' → ');
+    const exactFamilyIdx = exactFamilyByPath.get(path.path_idx);
+    const motifFamilyIdx = motifFamilyByPath.get(path.path_idx);
+    const exactAccent = getFamilyColor(exactFamilyIdx || path.path_idx, 0);
+    const motifAccent = getFamilyColor(motifFamilyIdx || path.path_idx, 4);
+    const includeTag = path.included
+      ? '<span class="tag tag-asym">Included</span>'
+      : `<span class="tag tag-nonasym">${path.exclusion_reason || 'Excluded'}</span>`;
+
+    html += `
+      <div
+        class="path-item siso-path-item ${path.included ? 'is-included' : 'is-excluded'}"
+        data-idx="${path.path_idx}"
+        data-path-idx="${path.path_idx}"
+        data-qk="${changeQK}"
+        data-node="${nodeId}"
+        style="--exact-accent:${exactAccent}; --exact-soft:${hexToRgba(exactAccent, 0.14)}; --motif-accent:${motifAccent}; --motif-soft:${hexToRgba(motifAccent, 0.14)};"
+        onclick="selectSISOPath(this)"
+      >
+        <div class="siso-path-head">
+          <div class="siso-path-title">Path #${path.path_idx}</div>
+          <button type="button" class="btn btn-small siso-inline-btn" onclick="event.stopPropagation(); plotSISOPath('${nodeId}', '${changeQK}', ${path.path_idx});">Plot</button>
+        </div>
+        <div class="siso-path-badges">
+          ${exactFamilyIdx ? `<span class="family-badge family-badge-exact" style="--badge-accent:${exactAccent}; --badge-soft:${hexToRgba(exactAccent, 0.18)};">Exact ${exactFamilyIdx}</span>` : ''}
+          ${motifFamilyIdx ? `<span class="family-badge family-badge-motif" style="--badge-accent:${motifAccent}; --badge-soft:${hexToRgba(motifAccent, 0.18)};">Motif ${motifFamilyIdx}</span>` : ''}
+          ${includeTag}
+        </div>
+        <div class="siso-path-detail">${permStr}</div>
+        <div class="siso-path-meta">
+          <span>RO ${path.exact_label}</span>
+          <span>Motif ${path.motif_label}</span>
+          <span>Vol ${formatVolumeSummary(path.volume)}</span>
+        </div>
+      </div>
+    `;
+  });
+
+  html += `
+      </div>
+    </section>
+  `;
+
+  const showPlot = includedFeasiblePaths.length > 0 ? '' : 'display:none;';
+  html += `<div class="plot-container" id="${nodeId}-traj-plot" style="${showPlot}"></div>`;
+  return html;
+}
+
+function normalizeSISOConfig(rawConfig) {
+  if (!rawConfig) return null;
+  const nested = rawConfig.config || {};
+  return {
+    change_qK: rawConfig.change_qK ?? rawConfig.changeQK ?? nested.change_qK ?? nested.changeQK ?? '',
+    observe_x: rawConfig.observe_x ?? rawConfig.observeX ?? nested.observe_x ?? nested.observeX ?? '',
+    path_scope: rawConfig.path_scope ?? rawConfig.pathScope ?? nested.path_scope ?? nested.pathScope ?? 'feasible',
+    min_volume_mean: rawConfig.min_volume_mean ?? rawConfig.minVolumeMean ?? nested.min_volume_mean ?? nested.minVolumeMean ?? 0,
+    keep_singular: rawConfig.keep_singular ?? rawConfig.keepSingular ?? nested.keep_singular ?? nested.keepSingular ?? true,
+    keep_nonasymptotic: rawConfig.keep_nonasymptotic ?? rawConfig.keepNonasymptotic ?? nested.keep_nonasymptotic ?? nested.keepNonasymptotic ?? false,
+    min: rawConfig.min ?? nested.min ?? -6,
+    max: rawConfig.max ?? nested.max ?? 6,
+  };
+}
+
+function getConnectedSISOConfig(resultNodeId) {
+  const paramsConn = connections.find(c => c.toNode === resultNodeId && c.toPort === 'params');
+  if (!paramsConn) return null;
+  const paramsNodeId = paramsConn.fromNode;
+  const liveConfig = normalizeSISOConfig(getNodeSerialData(paramsNodeId, 'siso-params'));
+  if (liveConfig) {
+    const paramsInfo = nodeRegistry[paramsNodeId];
+    if (paramsInfo) {
+      paramsInfo.data = paramsInfo.data || {};
+      paramsInfo.data.config = liveConfig;
+    }
+    return liveConfig;
+  }
+  return normalizeSISOConfig(nodeRegistry[paramsNodeId]?.data?.config);
 }
 
 async function computeSISOResult(nodeId) {
@@ -1844,30 +2248,39 @@ async function computeSISOResult(nodeId) {
   }
 
   const paramsNode = nodeRegistry[paramsConn.fromNode];
-  if (!paramsNode || !paramsNode.data || !paramsNode.data.config) {
+  const config = getConnectedSISOConfig(nodeId);
+  if (!paramsNode || !config) {
     showToast('SISO Config node has no configuration');
     return;
   }
 
-  const config = paramsNode.data.config;
   setNodeLoading(nodeId, true);
   const contentEl = document.getElementById(`${nodeId}-content`);
+  const previousSelectedPath = nodeRegistry[nodeId]?.data?.selectedPath?.path_idx || null;
 
   try {
-    const data = await api('siso_paths', {
+    const data = await api('behavior_families', {
       session_id: state.sessionId,
-      change_qK: config.changeQK || config.change_qK
+      change_qK: config.change_qK,
+      observe_x: config.observe_x,
+      path_scope: config.path_scope,
+      min_volume_mean: config.min_volume_mean,
+      keep_singular: config.keep_singular,
+      keep_nonasymptotic: config.keep_nonasymptotic,
+      deduplicate: true,
+      compute_volume: true,
     });
-
-    let html = `<div style="margin-bottom:8px;"><strong>${data.n_paths}</strong> paths, <strong>${data.sources.length}</strong> sources, <strong>${data.sinks.length}</strong> sinks</div>`;
-    html += '<div class="path-list">';
-    data.paths.forEach(p => {
-      const permStr = p.perms.map(pr => `[${pr.join(',')}]`).join(' → ');
-      html += `<div class="path-item" data-idx="${p.idx}" data-qk="${config.changeQK || config.change_qK}" data-node="${nodeId}" onclick="selectSISOPath(this)">#${p.idx}: ${permStr}</div>`;
-    });
-    html += '</div>';
-    html += `<div class="plot-container" id="${nodeId}-traj-plot" style="display:none;"></div>`;
-    contentEl.innerHTML = html;
+    if (nodeRegistry[nodeId]) {
+      nodeRegistry[nodeId].data = nodeRegistry[nodeId].data || {};
+      nodeRegistry[nodeId].data.behaviorData = data;
+    }
+    contentEl.innerHTML = renderBehaviorFamiliesResult(nodeId, config.change_qK, data);
+    const pathStillExists = previousSelectedPath && (data.paths || []).some(path => path.path_idx === previousSelectedPath);
+    if (pathStillExists) {
+      await plotSISOPath(nodeId, config.change_qK, previousSelectedPath);
+    } else {
+      clearSISOSelection(nodeId, previousSelectedPath !== null);
+    }
   } catch (e) {
     contentEl.innerHTML = `<div class="node-error">${e.message}</div>`;
   } finally {
@@ -1966,21 +2379,29 @@ function updateROPCloudMode(nodeId) {
 }
 
 // ===== SISO Path Selection =====
-async function selectSISOPath(el) {
-  // Deselect siblings
-  const parent = el.closest('.path-list');
-  if (parent) parent.querySelectorAll('.path-item').forEach(p => p.classList.remove('selected'));
-  el.classList.add('selected');
-
-  const pathIdx = parseInt(el.dataset.idx);
-  const changeQK = el.dataset.qk;
-  const nodeId = el.dataset.node;
-
+async function plotSISOPath(nodeId, changeQK, pathIdx, selectedEl = null) {
+  const config = getConnectedSISOConfig(nodeId);
+  const contentEl = document.getElementById(`${nodeId}-content`);
+  if (contentEl) {
+    contentEl.querySelectorAll('.path-item, .path-chip').forEach(p => {
+      const currentIdx = parseInt(p.dataset.pathIdx || p.dataset.idx, 10);
+      p.classList.toggle('selected', currentIdx === pathIdx);
+    });
+  }
+  setSISOSelection(nodeId, changeQK, pathIdx);
+  if (contentEl && selectedEl) {
+    const listItem = contentEl.querySelector(`.path-item[data-path-idx="${pathIdx}"]`);
+    if (listItem && listItem !== selectedEl) {
+      listItem.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    }
+  }
   try {
     const data = await api('siso_trajectory', {
       session_id: state.sessionId,
       change_qK: changeQK,
       path_idx: pathIdx,
+      start: config?.min ?? -6,
+      stop: config?.max ?? 6,
     });
     const plotEl = document.getElementById(`${nodeId}-traj-plot`);
     if (plotEl) {
@@ -1989,6 +2410,264 @@ async function selectSISOPath(el) {
     }
   } catch (e) {
     console.error('Trajectory failed:', e);
+  }
+}
+
+async function selectSISOPath(el) {
+  const pathIdx = parseInt(el.dataset.idx);
+  const changeQK = el.dataset.qk;
+  const nodeId = el.dataset.node;
+  await plotSISOPath(nodeId, changeQK, pathIdx, el);
+}
+
+function getConnectedSISOSelection(nodeId) {
+  const conn = connections.find(c => c.toNode === nodeId && c.toPort === 'result');
+  if (!conn) return null;
+  const sourceInfo = nodeRegistry[conn.fromNode];
+  if (!sourceInfo) return null;
+  return {
+    sourceNodeId: conn.fromNode,
+    sourceInfo,
+    selection: sourceInfo.data?.selectedPath || null,
+  };
+}
+
+function formatPolyNumber(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) return String(value);
+  if (Math.abs(num) < 1e-9) return '0';
+  if (Math.abs(num - Math.round(num)) < 1e-9) return String(Math.round(num));
+  return num.toFixed(3).replace(/\.?0+$/, '');
+}
+
+function formatPolyConstraint(row, rhs, symbols, isEquality = false) {
+  const terms = [];
+  row.forEach((coeff, idx) => {
+    const num = Number(coeff);
+    if (!Number.isFinite(num) || Math.abs(num) < 1e-9) return;
+    const absCoeff = Math.abs(num);
+    const coeffStr = Math.abs(absCoeff - 1) < 1e-9 ? '' : `${formatPolyNumber(absCoeff)}*`;
+    const sign = num < 0 ? '-' : (terms.length ? '+' : '');
+    terms.push(`${sign}${coeffStr}${symbols[idx]}`);
+  });
+  const lhs = terms.length ? terms.join(' ') : '0';
+  return `${lhs} ${isEquality ? '=' : '≤'} ${formatPolyNumber(rhs)}`;
+}
+
+function renderPolyCoordinateTable(rows, symbols, kind, linealitySet = new Set()) {
+  if (!rows || !rows.length) return '';
+  const header = symbols.map(sym => `<th>${sym}</th>`).join('');
+  const label = kind === 'rays' ? 'R' : 'V';
+  const extraHeader = kind === 'rays' ? '<th>Type</th>' : '';
+  const body = rows.map((row, idx) => {
+    const cells = row.map(value => `<td class="siso-profile-cell">${formatPolyNumber(value)}</td>`).join('');
+    const extraCell = kind === 'rays'
+      ? `<td>${linealitySet.has(idx + 1) ? '<span class="tag tag-nonasym">lineality</span>' : '<span class="tag tag-asym">ray</span>'}</td>`
+      : '';
+    return `<tr><td>${label}${idx + 1}</td>${cells}${extraCell}</tr>`;
+  }).join('');
+  return `
+    <div class="siso-table-wrap scroll-panel">
+      <table class="siso-family-table">
+        <thead><tr><th>#</th>${header}${extraHeader}</tr></thead>
+        <tbody>${body}</tbody>
+      </table>
+    </div>
+  `;
+}
+
+function convexHull2D(points) {
+  if (points.length <= 1) return points.slice();
+  const sorted = points
+    .map((point, index) => ({ ...point, index }))
+    .sort((a, b) => a.x - b.x || a.y - b.y || a.index - b.index);
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const lower = [];
+  sorted.forEach(point => {
+    while (lower.length >= 2 && cross(lower[lower.length - 2], lower[lower.length - 1], point) <= 0) lower.pop();
+    lower.push(point);
+  });
+  const upper = [];
+  for (let i = sorted.length - 1; i >= 0; i--) {
+    const point = sorted[i];
+    while (upper.length >= 2 && cross(upper[upper.length - 2], upper[upper.length - 1], point) <= 0) upper.pop();
+    upper.push(point);
+  }
+  lower.pop();
+  upper.pop();
+  return lower.concat(upper);
+}
+
+function plotQKPolyhedron(polyData, qkSymbols, plotId) {
+  if (!polyData || polyData.dimension !== 2 || !polyData.is_bounded || !(polyData.vertices || []).length) return;
+
+  const points = polyData.vertices.map(vertex => ({ x: Number(vertex[0]), y: Number(vertex[1]) }))
+    .filter(point => Number.isFinite(point.x) && Number.isFinite(point.y));
+  if (!points.length) return;
+
+  const hull = convexHull2D(points);
+  const traces = [];
+  if (hull.length >= 2) {
+    const closed = hull.concat(hull[0]);
+    traces.push({
+      x: closed.map(point => point.x),
+      y: closed.map(point => point.y),
+      mode: 'lines',
+      type: 'scatter',
+      fill: 'toself',
+      fillcolor: 'rgba(108, 140, 255, 0.14)',
+      line: { color: '#6c8cff', width: 2 },
+      name: 'Boundary',
+      hoverinfo: 'skip',
+    });
+  }
+  traces.push({
+    x: points.map(point => point.x),
+    y: points.map(point => point.y),
+    mode: 'markers',
+    type: 'scatter',
+    marker: { color: '#ff922b', size: 8 },
+    name: 'Vertices',
+    hovertemplate: `${qkSymbols[0]}=%{x:.3f}<br>${qkSymbols[1]}=%{y:.3f}<extra></extra>`,
+  });
+
+  Plotly.newPlot(plotId, traces, {
+    autosize: true,
+    paper_bgcolor: '#111',
+    plot_bgcolor: '#1a1a1a',
+    font: { color: '#888', size: 10 },
+    margin: { t: 40, b: 60, l: 70, r: 20 },
+    title: { text: 'qK-space Polyhedron', font: { color: '#888', size: 11 }, y: 0.98, yanchor: 'top' },
+    xaxis: { title: qkSymbols[0], gridcolor: '#333', zerolinecolor: '#444' },
+    yaxis: { title: qkSymbols[1], gridcolor: '#333', zerolinecolor: '#444' },
+    showlegend: true,
+  }, { responsive: true, displayModeBar: false });
+}
+
+function renderQKPolyhedronResult(nodeId, selection, payload) {
+  const poly = payload.polyhedra?.[0];
+  if (!poly) {
+    return { html: '<div class="node-error">No polyhedron data returned for the selected path.</div>', canPlot: false };
+  }
+
+  const qkSymbols = payload.qk_symbols || [];
+  const linearConstraints = new Set(poly.linear_constraints || []);
+  const rayLineality = new Set(poly.ray_lineality || []);
+  const vertices = poly.vertices || [];
+  const rays = poly.rays || [];
+  const canPlot = poly.dimension === 2 && poly.is_bounded && vertices.length > 0;
+
+  const constraintRows = (poly.A || []).map((row, idx) => `
+    <tr>
+      <td>C${idx + 1}</td>
+      <td class="siso-profile-cell">${formatPolyConstraint(row, poly.b?.[idx], qkSymbols, linearConstraints.has(idx + 1))}</td>
+    </tr>
+  `).join('');
+
+  let html = `
+    <div class="siso-summary-line">
+      <span class="summary-chip"><strong>Path #${selection.path_idx}</strong></span>
+      ${selection.exact_family_idx ? `<span class="family-badge family-badge-exact">E${selection.exact_family_idx}</span>` : ''}
+      ${selection.motif_family_idx ? `<span class="family-badge family-badge-motif">M${selection.motif_family_idx}</span>` : ''}
+      <span class="summary-chip">${selection.observe_x}</span>
+      <span class="summary-chip">${payload.change_qK} scanned</span>
+    </div>
+    <div class="siso-scope-note">
+      Fixed coordinates: ${qkSymbols.length ? qkSymbols.join(', ') : 'n/a'}<br>
+      Dimension ${poly.dimension}, constraints ${poly.n_constraints ?? (poly.A || []).length}, vertices ${poly.n_vertices ?? vertices.length}, rays ${poly.n_rays ?? rays.length}.
+    </div>
+  `;
+
+  if (!canPlot) {
+    html += `
+      <div class="text-dim">
+        Direct geometric plotting is only shown for bounded 2D path polyhedra. This selected path is ${poly.dimension}D${poly.is_bounded ? '' : ' and unbounded'}.
+      </div>
+    `;
+  } else {
+    html += `<div class="plot-container" id="${nodeId}-plot"></div>`;
+  }
+
+  html += `
+    <section class="siso-section">
+      <div class="siso-section-head">
+        <div class="siso-section-title">H-Representation</div>
+        <div class="text-dim">${(poly.A || []).length} rows</div>
+      </div>
+      <div class="siso-table-wrap scroll-panel">
+        <table class="siso-family-table">
+          <thead><tr><th>#</th><th>Constraint</th></tr></thead>
+          <tbody>${constraintRows || '<tr><td colspan="2" class="text-dim">No constraints</td></tr>'}</tbody>
+        </table>
+      </div>
+    </section>
+  `;
+
+  if (vertices.length) {
+    html += `
+      <section class="siso-section">
+        <div class="siso-section-head">
+          <div class="siso-section-title">Vertices</div>
+          <div class="text-dim">${vertices.length} points</div>
+        </div>
+        ${renderPolyCoordinateTable(vertices, qkSymbols, 'vertices')}
+      </section>
+    `;
+  }
+
+  if (rays.length) {
+    html += `
+      <section class="siso-section">
+        <div class="siso-section-head">
+          <div class="siso-section-title">Rays</div>
+          <div class="text-dim">${rays.length} directions</div>
+        </div>
+        ${renderPolyCoordinateTable(rays, qkSymbols, 'rays', rayLineality)}
+      </section>
+    `;
+  }
+
+  return { html, canPlot };
+}
+
+async function executeQKPolyResult(nodeId) {
+  const contentEl = document.getElementById(`${nodeId}-content`);
+  const source = getConnectedSISOSelection(nodeId);
+  if (!source) {
+    if (contentEl) contentEl.innerHTML = '<span class="text-dim">Connect to a SISO Behaviors node first.</span>';
+    return;
+  }
+
+  const selection = source.selection;
+  if (!selection) {
+    if (contentEl) contentEl.innerHTML = '<span class="text-dim">Select a path in the upstream SISO Behaviors node.</span>';
+    return;
+  }
+
+  setNodeLoading(nodeId, true);
+  try {
+    const payload = await api('siso_polyhedra', {
+      session_id: state.sessionId,
+      change_qK: selection.change_qK,
+      path_indices: [selection.path_idx],
+    });
+    if (nodeRegistry[nodeId]) {
+      nodeRegistry[nodeId].data = nodeRegistry[nodeId].data || {};
+      nodeRegistry[nodeId].data.selection = selection;
+      nodeRegistry[nodeId].data.polyhedronPayload = payload;
+    }
+    const rendered = renderQKPolyhedronResult(nodeId, selection, payload);
+    contentEl.innerHTML = rendered.html;
+    if (rendered.canPlot) {
+      setTimeout(() => {
+        plotQKPolyhedron(payload.polyhedra?.[0], payload.qk_symbols || [], `${nodeId}-plot`);
+        setupPlotResize(nodeId, `${nodeId}-plot`);
+      }, 50);
+    }
+  } catch (e) {
+    contentEl.innerHTML = `<div class="node-error">${e.message}</div>`;
+  } finally {
+    setNodeLoading(nodeId, false);
   }
 }
 
@@ -2239,9 +2918,29 @@ function getNodeSerialData(nodeId, type) {
     }
     case 'siso-params': {
       const changeQK = document.getElementById(`${nodeId}-siso-select`)?.value || '';
+      const observeX = document.getElementById(`${nodeId}-target-x`)?.value || '';
+      const pathScope = document.getElementById(`${nodeId}-path-scope`)?.value || 'feasible';
+      const minVolumeMean = parseFloat(document.getElementById(`${nodeId}-min-volume`)?.value || '0');
+      const keepSingular = document.getElementById(`${nodeId}-keep-singular`)?.checked ?? true;
+      const keepNonasymptotic = document.getElementById(`${nodeId}-keep-nonasym`)?.checked ?? false;
       const min = parseFloat(document.getElementById(`${nodeId}-min`)?.value || '-6');
       const max = parseFloat(document.getElementById(`${nodeId}-max`)?.value || '6');
-      return { changeQK, min, max, config: nodeRegistry[nodeId]?.data?.config };
+      return {
+        changeQK,
+        observeX,
+        pathScope,
+        minVolumeMean,
+        keepSingular,
+        keepNonasymptotic,
+        min,
+        max,
+        config: nodeRegistry[nodeId]?.data?.config,
+      };
+    }
+    case 'siso-result': {
+      return {
+        selectedPath: nodeRegistry[nodeId]?.data?.selectedPath || null,
+      };
     }
     case 'rop-cloud': {
       const mode = document.getElementById(`${nodeId}-sampling-mode`)?.value || 'x_space';
@@ -2305,13 +3004,46 @@ function getNodeSerialData(nodeId, type) {
         output_expr: expr
       };
     }
+    case 'rop-polyhedron': {
+      const dimension = parseInt(document.getElementById(`${nodeId}-dimension`)?.value || '2', 10);
+      const pairs = [];
+      const axisCount = dimension === 3 ? 3 : 2;
+      for (let i = 1; i <= axisCount; i++) {
+        pairs.push({
+          x_symbol: document.getElementById(`${nodeId}-x${i}`)?.value || '',
+          qk_symbol: document.getElementById(`${nodeId}-qk${i}`)?.value || '',
+        });
+      }
+      return {
+        dimension,
+        pairs,
+        add_inner_points: document.getElementById(`${nodeId}-add-inner-points`)?.checked ?? true,
+        npoints: parseInt(document.getElementById(`${nodeId}-npoints`)?.value || '5000', 10),
+        singular_extends: parseFloat(document.getElementById(`${nodeId}-singular-extends`)?.value || '2'),
+        config: nodeRegistry[nodeId]?.data?.config,
+      };
+    }
     case 'rop-poly-params': {
-      const expr = document.getElementById(`${nodeId}-expr`)?.value || '';
-      const param1 = document.getElementById(`${nodeId}-param1`)?.value || '';
-      const param2 = document.getElementById(`${nodeId}-param2`)?.value || '';
-      const asymptotic = document.getElementById(`${nodeId}-asymptotic`)?.checked ?? true;
-      const maxVertices = parseInt(document.getElementById(`${nodeId}-max-vertices`)?.value || '1000');
-      return { expr, param1, param2, asymptotic, maxVertices, config: nodeRegistry[nodeId]?.data?.config };
+      const dimension = parseInt(document.getElementById(`${nodeId}-dimension`)?.value || '2');
+      const pairs = [];
+      const axisCount = dimension === 3 ? 3 : 2;
+      for (let i = 1; i <= axisCount; i++) {
+        pairs.push({
+          x_symbol: document.getElementById(`${nodeId}-x${i}`)?.value || '',
+          qk_symbol: document.getElementById(`${nodeId}-qk${i}`)?.value || '',
+        });
+      }
+      const addInnerPoints = document.getElementById(`${nodeId}-add-inner-points`)?.checked ?? true;
+      const npoints = parseInt(document.getElementById(`${nodeId}-npoints`)?.value || '5000');
+      const singularExtends = parseFloat(document.getElementById(`${nodeId}-singular-extends`)?.value || '2');
+      return {
+        dimension,
+        pairs,
+        add_inner_points: addInnerPoints,
+        npoints,
+        singular_extends: singularExtends,
+        config: nodeRegistry[nodeId]?.data?.config,
+      };
     }
     default:
       return {};
@@ -2492,6 +3224,31 @@ function restoreNodeData(nodeId, type, data) {
       if (exprEl && data.output_exprs && data.output_exprs[0]) exprEl.value = data.output_exprs[0];
       break;
     }
+    case 'siso-params': {
+      const changeEl = document.getElementById(`${nodeId}-siso-select`);
+      const targetEl = document.getElementById(`${nodeId}-target-x`);
+      const scopeEl = document.getElementById(`${nodeId}-path-scope`);
+      const minVolumeEl = document.getElementById(`${nodeId}-min-volume`);
+      const keepSingularEl = document.getElementById(`${nodeId}-keep-singular`);
+      const keepNonasymEl = document.getElementById(`${nodeId}-keep-nonasym`);
+      const minEl = document.getElementById(`${nodeId}-min`);
+      const maxEl = document.getElementById(`${nodeId}-max`);
+      if (changeEl && data.changeQK) changeEl.value = data.changeQK;
+      if (targetEl && data.observeX) targetEl.value = data.observeX;
+      if (scopeEl && data.pathScope) scopeEl.value = data.pathScope;
+      if (minVolumeEl && data.minVolumeMean != null) minVolumeEl.value = data.minVolumeMean;
+      if (keepSingularEl && data.keepSingular != null) keepSingularEl.checked = data.keepSingular;
+      if (keepNonasymEl && data.keepNonasymptotic != null) keepNonasymEl.checked = data.keepNonasymptotic;
+      if (minEl && data.min != null) minEl.value = data.min;
+      if (maxEl && data.max != null) maxEl.value = data.max;
+      break;
+    }
+    case 'siso-result': {
+      if (nodeRegistry[nodeId]) {
+        nodeRegistry[nodeId].data.selectedPath = data.selectedPath || null;
+      }
+      break;
+    }
     case 'rop-cloud-params': {
       const modeEl = document.getElementById(`${nodeId}-sampling-mode`);
       const samplesEl = document.getElementById(`${nodeId}-samples`);
@@ -2555,17 +3312,46 @@ function restoreNodeData(nodeId, type, data) {
       if (exprEl && data.output_expr) exprEl.value = data.output_expr;
       break;
     }
+    case 'rop-polyhedron': {
+      const dimensionEl = document.getElementById(`${nodeId}-dimension`);
+      const addInnerEl = document.getElementById(`${nodeId}-add-inner-points`);
+      const npointsEl = document.getElementById(`${nodeId}-npoints`);
+      const singularExtendsEl = document.getElementById(`${nodeId}-singular-extends`);
+      if (dimensionEl && data.dimension != null) dimensionEl.value = data.dimension;
+      if (addInnerEl && data.add_inner_points != null) addInnerEl.checked = data.add_inner_points;
+      if (npointsEl && data.npoints != null) npointsEl.value = data.npoints;
+      if (singularExtendsEl && data.singular_extends != null) singularExtendsEl.value = data.singular_extends;
+      (data.pairs || []).forEach((pair, idx) => {
+        const axis = idx + 1;
+        const xEl = document.getElementById(`${nodeId}-x${axis}`);
+        const qkEl = document.getElementById(`${nodeId}-qk${axis}`);
+        if (xEl && pair.x_symbol) xEl.value = pair.x_symbol;
+        if (qkEl && pair.qk_symbol) qkEl.value = pair.qk_symbol;
+      });
+      updateROPPolyDimension(nodeId);
+      if (nodeRegistry[nodeId]) {
+        nodeRegistry[nodeId].data = nodeRegistry[nodeId].data || {};
+        nodeRegistry[nodeId].data.config = data.config || data;
+      }
+      break;
+    }
     case 'rop-poly-params': {
-      const exprEl = document.getElementById(`${nodeId}-expr`);
-      const param1El = document.getElementById(`${nodeId}-param1`);
-      const param2El = document.getElementById(`${nodeId}-param2`);
-      const asymptoticEl = document.getElementById(`${nodeId}-asymptotic`);
-      const maxVerticesEl = document.getElementById(`${nodeId}-max-vertices`);
-      if (exprEl && data.expr) exprEl.value = data.expr;
-      if (param1El && data.param1) param1El.value = data.param1;
-      if (param2El && data.param2) param2El.value = data.param2;
-      if (asymptoticEl && data.asymptotic != null) asymptoticEl.checked = data.asymptotic;
-      if (maxVerticesEl && data.maxVertices != null) maxVerticesEl.value = data.maxVertices;
+      const dimensionEl = document.getElementById(`${nodeId}-dimension`);
+      const addInnerEl = document.getElementById(`${nodeId}-add-inner-points`);
+      const npointsEl = document.getElementById(`${nodeId}-npoints`);
+      const singularExtendsEl = document.getElementById(`${nodeId}-singular-extends`);
+      if (dimensionEl && data.dimension != null) dimensionEl.value = data.dimension;
+      if (addInnerEl && data.add_inner_points != null) addInnerEl.checked = data.add_inner_points;
+      if (npointsEl && data.npoints != null) npointsEl.value = data.npoints;
+      if (singularExtendsEl && data.singular_extends != null) singularExtendsEl.value = data.singular_extends;
+      (data.pairs || []).forEach((pair, idx) => {
+        const axis = idx + 1;
+        const xEl = document.getElementById(`${nodeId}-x${axis}`);
+        const qkEl = document.getElementById(`${nodeId}-qk${axis}`);
+        if (xEl && pair.x_symbol) xEl.value = pair.x_symbol;
+        if (qkEl && pair.qk_symbol) qkEl.value = pair.qk_symbol;
+      });
+      updateROPPolyDimension(nodeId);
       if (data.config && nodeRegistry[nodeId]) {
         nodeRegistry[nodeId].data.config = data.config;
       }
@@ -2996,12 +3782,13 @@ async function executeROPPolyResult(nodeId) {
   }
 
   const paramsNode = nodeRegistry[conn.fromNode];
-  if (!paramsNode || !paramsNode.data.config) {
+  const config = getNodeSerialData(conn.fromNode, 'rop-poly-params');
+  if (!paramsNode || !config || !(config.pairs || []).length) {
     alert('Config node has no configuration. Please configure it first.');
     return;
   }
-
-  const config = paramsNode.data.config;
+  paramsNode.data = paramsNode.data || {};
+  paramsNode.data.config = config;
   setNodeLoading(nodeId, true);
   const contentEl = document.getElementById(`${nodeId}-content`);
 
@@ -3010,12 +3797,7 @@ async function executeROPPolyResult(nodeId) {
       session_id: state.sessionId,
       ...config
     });
-
-    contentEl.innerHTML = `<div class="plot-container" id="${nodeId}-plot"></div>`;
-    setTimeout(() => {
-      plotROPPolyhedron(data, `${nodeId}-plot`);
-      setupPlotResize(nodeId, `${nodeId}-plot`);
-    }, 50);
+    renderROPPolyhedronOutput(nodeId, contentEl, data, config);
   } catch (e) {
     contentEl.innerHTML = `<div class="node-error">${e.message}</div>`;
   } finally {
@@ -3169,45 +3951,33 @@ function plotParameterScan2D(data, plotId) {
 }
 
 // ===== ROP Polyhedron Helper Functions =====
-function insertSpeciesPoly(nodeId) {
-  const helper = document.getElementById(`${nodeId}-species-helper`);
-  const expr = document.getElementById(`${nodeId}-expr`);
-  if (helper.value && expr) {
-    expr.value += (expr.value ? ' + ' : '') + helper.value;
-    helper.value = '';
-  }
+function updateROPPolyDimension(nodeId) {
+  const dimension = parseInt(document.getElementById(`${nodeId}-dimension`)?.value || '2', 10);
+  const axis3XRow = document.getElementById(`${nodeId}-axis3-x-row`);
+  const axis3QKRow = document.getElementById(`${nodeId}-axis3-qk-row`);
+  const showAxis3 = dimension === 3;
+  if (axis3XRow) axis3XRow.style.display = showAxis3 ? '' : 'none';
+  if (axis3QKRow) axis3QKRow.style.display = showAxis3 ? '' : 'none';
 }
 
 async function runROPPolyhedron(nodeId) {
-  const expr = document.getElementById(`${nodeId}-expr`).value.trim();
-  const param1 = document.getElementById(`${nodeId}-param1`).value;
-  const param2 = document.getElementById(`${nodeId}-param2`).value;
-  const asymptotic = document.getElementById(`${nodeId}-asymptotic`).checked;
-  const maxVertices = parseInt(document.getElementById(`${nodeId}-max-vertices`).value);
-
-  if (!expr) {
-    alert('Please enter an output expression');
+  const config = getNodeSerialData(nodeId, 'rop-polyhedron');
+  if (!(config.pairs || []).length || config.pairs.some(pair => !pair.x_symbol || !pair.qk_symbol)) {
+    alert('Please select species and qK symbols for each ROP axis');
     return;
   }
 
+  nodeRegistry[nodeId].data = nodeRegistry[nodeId].data || {};
+  nodeRegistry[nodeId].data.config = config;
   setNodeLoading(nodeId, true);
   const contentEl = document.getElementById(`${nodeId}-content`);
 
   try {
     const data = await api('rop_polyhedron', {
       session_id: state.sessionId,
-      output_expr: expr,
-      param1_symbol: param1,
-      param2_symbol: param2,
-      asymptotic_only: asymptotic,
-      max_vertices: maxVertices,
+      ...config,
     });
-
-    contentEl.innerHTML = `<div class="plot-container" id="${nodeId}-plot"></div>`;
-    setTimeout(() => {
-      plotROPPolyhedron(data, `${nodeId}-plot`);
-      setupPlotResize(nodeId, `${nodeId}-plot`);
-    }, 50);
+    renderROPPolyhedronOutput(nodeId, contentEl, data, config);
   } catch (e) {
     contentEl.innerHTML = `<div class="node-error">${e.message}</div>`;
   } finally {
@@ -3215,13 +3985,232 @@ async function runROPPolyhedron(nodeId) {
   }
 }
 
-function plotROPPolyhedron(data, plotId) {
-  const { output_expr, param1_symbol, param2_symbol, vertices, edges } = data;
+function renderROPPolyhedronOutput(nodeId, contentEl, data, config = {}) {
+  const axisSummary = (data.pairs || config.pairs || []).map((pair, idx) => {
+    const xSymbol = pair.x_symbol || pair.xSymbol || '?';
+    const qkSymbol = pair.qk_symbol || pair.qkSymbol || '?';
+    return `<span class="summary-chip">A${idx + 1}: ${xSymbol} / ${qkSymbol}</span>`;
+  }).join('');
+  const hasInnerPoints = (data.inner_points || []).length > 0;
 
+  nodeRegistry[nodeId].data = nodeRegistry[nodeId].data || {};
+  nodeRegistry[nodeId].data.ropPlotData = data;
+  nodeRegistry[nodeId].data.fitInnerPoints = false;
+
+  contentEl.innerHTML = `
+    <div class="siso-summary-line">
+      <span class="summary-chip"><strong>${data.dimension || config.dimension}D</strong></span>
+      ${axisSummary}
+    </div>
+    <div class="siso-summary-line">
+      <label class="summary-chip ${hasInnerPoints ? '' : 'text-dim'}" style="display:inline-flex;align-items:center;gap:6px;cursor:${hasInnerPoints ? 'pointer' : 'default'};">
+        <input type="checkbox" id="${nodeId}-fit-inner-points" onchange="refreshROPPolyhedronPlot('${nodeId}')" ${hasInnerPoints ? '' : 'disabled'}>
+        Fit inner points
+      </label>
+    </div>
+    <div class="plot-container" id="${nodeId}-plot"></div>
+  `;
+
+  setTimeout(() => {
+    refreshROPPolyhedronPlot(nodeId);
+    setupPlotResize(nodeId, `${nodeId}-plot`);
+  }, 50);
+}
+
+function refreshROPPolyhedronPlot(nodeId) {
+  const data = nodeRegistry[nodeId]?.data?.ropPlotData;
+  if (!data) return;
+  const fitInnerPoints = document.getElementById(`${nodeId}-fit-inner-points`)?.checked ?? false;
+  if (nodeRegistry[nodeId]) {
+    nodeRegistry[nodeId].data = nodeRegistry[nodeId].data || {};
+    nodeRegistry[nodeId].data.fitInnerPoints = fitInnerPoints;
+  }
+  plotROPPolyhedron(data, `${nodeId}-plot`, { fitInnerPoints });
+}
+
+function getROPPlotBounds(data, options = {}) {
+  const dimension = data.dimension || 2;
+  const fitInnerPoints = options.fitInnerPoints === true;
+  const mins = Array(dimension).fill(Infinity);
+  const maxs = Array(dimension).fill(-Infinity);
+  let hasFiniteCoords = false;
+
+  const includeCoord = (coord) => {
+    if (!Array.isArray(coord) || coord.length < dimension) return;
+    const values = coord.slice(0, dimension).map(Number);
+    if (values.some(v => !Number.isFinite(v))) return;
+    hasFiniteCoords = true;
+    for (let i = 0; i < dimension; i++) {
+      if (values[i] < mins[i]) mins[i] = values[i];
+      if (values[i] > maxs[i]) maxs[i] = values[i];
+    }
+  };
+
+  const includeSegment = (segment) => {
+    includeCoord(segment.from);
+    includeCoord(segment.to);
+  };
+
+  (data.points || []).forEach(point => includeCoord(point.coords));
+  (data.direct_edges || []).forEach(includeSegment);
+  (data.indirect_edges || []).forEach(includeSegment);
+  (data.direct_rays || []).forEach(includeSegment);
+  (data.indirect_rays || []).forEach(includeSegment);
+  if (fitInnerPoints) {
+    (data.inner_points || []).forEach(includeCoord);
+  }
+
+  if (!hasFiniteCoords) return null;
+
+  return mins.map((minValue, idx) => {
+    const maxValue = maxs[idx];
+    if (!Number.isFinite(minValue) || !Number.isFinite(maxValue)) return null;
+    let pad = (maxValue - minValue) * 0.08;
+    if (!(pad > 0)) {
+      const scale = Math.max(Math.abs(minValue), Math.abs(maxValue), 1);
+      pad = scale * 0.08;
+    }
+    return [minValue - pad, maxValue + pad];
+  });
+}
+
+function plotROPPolyhedron(data, plotId, options = {}) {
+  if (data.points && data.direct_edges) {
+    const dimension = data.dimension || 2;
+    const is3D = dimension === 3;
+    const axisLabels = data.axis_labels || [];
+    const traces = [];
+    const ranges = getROPPlotBounds(data, options);
+
+    const pushSegmentTrace = (segment, name, color, dash = 'solid', width = 2, opacity = 1, showLegend = false) => {
+      const from = segment.from || [];
+      const to = segment.to || [];
+      const common = {
+        mode: 'lines',
+        name,
+        showlegend: showLegend,
+        hoverinfo: 'skip',
+        opacity,
+        line: is3D ? { color, width } : { color, width, dash },
+      };
+      if (is3D) {
+        traces.push({
+          x: [from[0], to[0]],
+          y: [from[1], to[1]],
+          z: [from[2], to[2]],
+          type: 'scatter3d',
+          ...common,
+        });
+      } else {
+        traces.push({
+          x: [from[0], to[0]],
+          y: [from[1], to[1]],
+          type: 'scatter',
+          ...common,
+        });
+      }
+    };
+
+    (data.direct_edges || []).forEach((edge, idx) => pushSegmentTrace(edge, 'Direct edge', '#e5e7eb', 'solid', 2, 1, idx === 0));
+    (data.indirect_edges || []).forEach((edge, idx) => pushSegmentTrace(edge, 'Indirect edge', '#9aa0a6', 'dash', 2, 1, idx === 0));
+    (data.direct_rays || []).forEach((edge, idx) => pushSegmentTrace(edge, 'Singular ray', '#8ecae6', 'solid', 4, 0.95, idx === 0));
+    (data.indirect_rays || []).forEach((edge, idx) => pushSegmentTrace(edge, 'Indirect singular ray', '#8ecae6', 'dash', 4, 0.85, idx === 0));
+
+    if ((data.inner_points || []).length) {
+      const inner = data.inner_points;
+      const common = {
+        mode: 'markers',
+        name: 'Inner points',
+        marker: { color: 'rgba(148, 163, 184, 0.18)', size: is3D ? 2 : 5 },
+        hoverinfo: 'skip',
+      };
+      if (is3D) {
+        traces.push({
+          x: inner.map(point => point[0]),
+          y: inner.map(point => point[1]),
+          z: inner.map(point => point[2]),
+          type: 'scatter3d',
+          ...common,
+        });
+      } else {
+        traces.push({
+          x: inner.map(point => point[0]),
+          y: inner.map(point => point[1]),
+          type: 'scatter',
+          ...common,
+        });
+      }
+    }
+
+    if ((data.points || []).length) {
+      const points = data.points;
+      const pointColor = point => point.point_type === 'asymptotic' ? '#ffb4a2' : '#b7efc5';
+      const hoverText = points.map(point => `Vertex ${point.vertex_idx}<br>Type: ${point.point_type}<br>Perm: [${(point.perm || []).join(',')}]`);
+      const common = {
+        mode: 'markers',
+        name: 'Vertices',
+        marker: {
+          size: is3D ? 6 : 9,
+          color: points.map(pointColor),
+          line: { color: '#111', width: 1 },
+        },
+        hovertext: hoverText,
+        hoverinfo: 'text',
+      };
+      if (is3D) {
+        traces.push({
+          x: points.map(point => point.coords[0]),
+          y: points.map(point => point.coords[1]),
+          z: points.map(point => point.coords[2]),
+          type: 'scatter3d',
+          ...common,
+        });
+      } else {
+        traces.push({
+          x: points.map(point => point.coords[0]),
+          y: points.map(point => point.coords[1]),
+          type: 'scatter',
+          ...common,
+        });
+      }
+    }
+
+    const layout = {
+      autosize: true,
+      paper_bgcolor: '#111',
+      plot_bgcolor: '#1a1a1a',
+      font: { color: '#888', size: 10 },
+      margin: { t: 40, b: 60, l: 70, r: 20 },
+      title: {
+        text: `ROP Polyhedron (${dimension}D)`,
+        font: { color: '#888', size: 11 },
+        y: 0.98,
+        yanchor: 'top',
+      },
+      showlegend: true,
+      legend: { bgcolor: 'rgba(0,0,0,0)', font: { color: '#888', size: 9 } },
+    };
+
+    if (is3D) {
+      layout.scene = {
+        xaxis: { title: axisLabels[0] || 'Axis 1', gridcolor: '#333', backgroundcolor: '#1a1a1a', range: ranges?.[0] },
+        yaxis: { title: axisLabels[1] || 'Axis 2', gridcolor: '#333', backgroundcolor: '#1a1a1a', range: ranges?.[1] },
+        zaxis: { title: axisLabels[2] || 'Axis 3', gridcolor: '#333', backgroundcolor: '#1a1a1a', range: ranges?.[2] },
+        bgcolor: '#1a1a1a',
+      };
+    } else {
+      layout.xaxis = { title: axisLabels[0] || 'Axis 1', gridcolor: '#333', zerolinecolor: '#444', range: ranges?.[0] };
+      layout.yaxis = { title: axisLabels[1] || 'Axis 2', gridcolor: '#333', zerolinecolor: '#444', range: ranges?.[1] };
+    }
+
+    Plotly.newPlot(plotId, traces, layout, { responsive: true, displayModeBar: false });
+    return;
+  }
+
+  const { output_expr, param1_symbol, param2_symbol, vertices, edges } = data;
   const traces = [];
 
-  // Add edges
-  edges.forEach(edge => {
+  (edges || []).forEach(edge => {
     traces.push({
       x: edge.ro1,
       y: edge.ro2,
@@ -3232,12 +4221,10 @@ function plotROPPolyhedron(data, plotId) {
     });
   });
 
-  // Add vertices
-  if (vertices.length > 0) {
+  if ((vertices || []).length > 0) {
     const vertexRO1 = vertices.map(v => v.ro1);
     const vertexRO2 = vertices.map(v => v.ro2);
     const hoverText = vertices.map(v => `Vertex ${v.idx}<br>Nullity: ${v.nullity}<br>Perm: [${v.perm.join(',')}]`);
-
     traces.push({
       x: vertexRO1,
       y: vertexRO2,

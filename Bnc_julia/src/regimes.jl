@@ -544,6 +544,8 @@ function get_vertices_neighbor_mat_qK(Bnc::Bnc)
     return spmat
 end
 
+get_vertices_neighbor_mat(args...; kwargs...) = get_vertices_neighbor_mat_qK(args...; kwargs...)
+
 
 #-------------------------------------------------------------------------------------
 #         functions involving single vertex and lazy calculate  its properties, act as keys for higher level functions

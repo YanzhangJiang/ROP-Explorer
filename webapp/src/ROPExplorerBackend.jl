@@ -277,13 +277,22 @@ function polyhedron_to_dict(poly)
         h = MixedMatHRep(hrep(poly))
         A = mat2vv(Matrix(h.A))
         b = Vector(h.b)
-        result = Dict("A" => A, "b" => b)
+        result = Dict(
+            "A" => A,
+            "b" => b,
+            "dimension" => size(h.A, 2),
+            "n_constraints" => size(h.A, 1),
+            "linear_constraints" => sort!(collect(h.linset)),
+        )
         # Try to get vertices
         try
             v = MixedMatVRep(vrep(poly))
-            if size(v.V, 1) > 0
-                result["vertices"] = mat2vv(Matrix(v.V))
-            end
+            result["vertices"] = size(v.V, 1) > 0 ? mat2vv(Matrix(v.V)) : []
+            result["rays"] = size(v.R, 1) > 0 ? mat2vv(Matrix(v.R)) : []
+            result["ray_lineality"] = sort!(collect(v.Rlinset))
+            result["n_vertices"] = size(v.V, 1)
+            result["n_rays"] = size(v.R, 1)
+            result["is_bounded"] = size(v.R, 1) == 0
         catch; end
         return result
     catch e
@@ -444,6 +453,105 @@ function compute_siso_trajectory(model, siso, path_idx; npoints=500, start_val=-
     )
 end
 
+json_safe_real(x::Real) = if isnan(x)
+    "NaN"
+elseif isinf(x)
+    signbit(x) ? "-Inf" : "Inf"
+else
+    Float64(x)
+end
+
+json_safe_profile(profile::AbstractVector{<:Real}) = [json_safe_real(x) for x in profile]
+
+volume_to_dict(vol) = isnothing(vol) ? nothing : Dict(
+    "mean" => vol.mean,
+    "var" => vol.var,
+    "std" => sqrt(vol.var),
+    "rel_error" => vol.mean == 0 ? nothing : sqrt(vol.var) / vol.mean,
+)
+
+function behavior_scope_note(path_scope::Symbol, min_volume_mean::Float64)
+    if path_scope == :all
+        return "Including every graph path, even when the corresponding path polyhedron is empty. Use this only for graph-level overviews."
+    elseif path_scope == :feasible
+        return "Including only paths with non-empty path polyhedra. Paths excluded here are graph-theoretic paths that have no common parameter region after all path constraints are intersected."
+    else
+        return "Including only feasible paths whose estimated volume mean is at least $(min_volume_mean). This is a robustness filter on top of feasibility."
+    end
+end
+
+function behavior_result_to_dict(model, siso, result)
+    path_dicts = Vector{Dict{String,Any}}(undef, length(result.path_records))
+    for rec in result.path_records
+        path_dicts[rec.path_idx] = Dict(
+            "path_idx" => rec.path_idx,
+            "vertex_indices" => collect(rec.vertex_indices),
+            "perms" => [collect(get_perm(model, idx)) for idx in rec.vertex_indices],
+            "exact_profile" => json_safe_profile(rec.exact_profile),
+            "exact_label" => rec.exact_label,
+            "motif_profile" => collect(rec.motif_profile),
+            "motif_label" => rec.motif_label,
+            "feasible" => rec.feasible,
+            "included" => rec.included,
+            "exclusion_reason" => rec.exclusion_reason,
+            "volume" => volume_to_dict(rec.volume),
+        )
+    end
+
+    exact_families = map(result.exact_families) do family
+        Dict(
+            "family_idx" => family.family_idx,
+            "exact_profile" => json_safe_profile(family.exact_profile),
+            "exact_label" => family.exact_label,
+            "motif_profile" => collect(family.motif_profile),
+            "motif_label" => family.motif_label,
+            "path_indices" => collect(family.path_indices),
+            "n_paths" => family.n_paths,
+            "total_volume" => volume_to_dict(family.total_volume),
+            "representative_path_idx" => family.representative_path_idx,
+            "representative_volume" => volume_to_dict(family.representative_volume),
+        )
+    end
+
+    motif_families = map(result.motif_families) do family
+        Dict(
+            "family_idx" => family.family_idx,
+            "motif_profile" => collect(family.motif_profile),
+            "motif_label" => family.motif_label,
+            "path_indices" => collect(family.path_indices),
+            "exact_family_indices" => collect(family.exact_family_indices),
+            "n_paths" => family.n_paths,
+            "total_volume" => volume_to_dict(family.total_volume),
+            "representative_path_idx" => family.representative_path_idx,
+            "representative_volume" => volume_to_dict(family.representative_volume),
+        )
+    end
+
+    return Dict(
+        "change_qK" => string(qK_sym(model)[result.change_qK_idx]),
+        "change_qK_idx" => result.change_qK_idx,
+        "observe_x" => string(x_sym(model)[result.observe_x_idx]),
+        "observe_x_idx" => result.observe_x_idx,
+        "path_scope" => string(result.path_scope),
+        "scope_note" => behavior_scope_note(result.path_scope, result.min_volume_mean),
+        "min_volume_mean" => result.min_volume_mean,
+        "deduplicate" => result.deduplicate,
+        "keep_singular" => result.keep_singular,
+        "keep_nonasymptotic" => result.keep_nonasymptotic,
+        "compute_volume" => result.compute_volume,
+        "total_paths" => result.total_paths,
+        "feasible_paths" => result.feasible_paths,
+        "included_paths" => result.included_paths,
+        "excluded_paths" => result.excluded_paths,
+        "exclusion_counts" => Dict(string(k) => v for (k, v) in result.exclusion_counts),
+        "paths" => path_dicts,
+        "exact_families" => exact_families,
+        "motif_families" => motif_families,
+        "sources" => collect(siso.sources),
+        "sinks" => collect(siso.sinks),
+    )
+end
+
 # ─── API Route Handlers ───
 
 function handle_build_model(req)
@@ -570,7 +678,11 @@ function handle_siso_polyhedra(req)
         push!(poly_data, pd)
     end
 
-    return json_response(Dict("polyhedra" => poly_data))
+    return json_response(Dict(
+        "change_qK" => string(qK_sym(model)[siso.change_qK_idx]),
+        "qk_symbols" => string.(qK_sym(siso)),
+        "polyhedra" => poly_data,
+    ))
 end
 
 function handle_siso_trajectory(req)
@@ -599,6 +711,44 @@ function handle_siso_trajectory(req)
     data = compute_siso_trajectory(model, siso, path_idx;
         npoints=npoints, start_val=start_val, stop_val=stop_val)
     return json_response(data)
+end
+
+function handle_behavior_families(req)
+    body = read_json(req)
+    sid = String(body[:session_id])
+    sess = get(MODELS, sid, nothing)
+    sess === nothing && return error_response("Invalid session_id"; status=404)
+    sess["last_access"] = time()
+
+    model = sess["model"]
+    change_qK = Symbol(body[:change_qK])
+    observe_x = haskey(body, :observe_x) ? Symbol(body[:observe_x]) : error("observe_x is required")
+    path_scope = Symbol(get(body, :path_scope, "feasible"))
+    min_volume_mean = Float64(get(body, :min_volume_mean, 0.0))
+    deduplicate = Bool(get(body, :deduplicate, true))
+    keep_singular = Bool(get(body, :keep_singular, true))
+    keep_nonasymptotic = Bool(get(body, :keep_nonasymptotic, false))
+    compute_volume = Bool(get(body, :compute_volume, true))
+
+    change_key = "siso_$(body[:change_qK])"
+    siso = get(sess, change_key, nothing)
+    if siso === nothing
+        siso = SISOPaths(model, change_qK)
+        sess[change_key] = siso
+    end
+
+    result = get_behavior_families(
+        siso;
+        observe_x=observe_x,
+        path_scope=path_scope,
+        min_volume_mean=min_volume_mean,
+        deduplicate=deduplicate,
+        keep_singular=keep_singular,
+        keep_nonasymptotic=keep_nonasymptotic,
+        compute_volume=compute_volume,
+    )
+
+    return json_response(behavior_result_to_dict(model, siso, result))
 end
 
 function handle_rop_cloud(req)
@@ -880,6 +1030,87 @@ function handle_rop_polyhedron(req)
 
     model = sess["model"]
 
+    if haskey(body, :pairs)
+        pairs_in = body[:pairs]
+        length(pairs_in) >= 2 || return error_response("At least two ROP axes are required"; status=400)
+
+        pairs = Tuple{Symbol, Symbol}[]
+        for pair in pairs_in
+            x_symbol = Symbol(pair[:x_symbol])
+            qk_symbol = Symbol(pair[:qk_symbol])
+            locate_sym_x(model, x_symbol) === nothing && return error_response("Unknown species: $x_symbol"; status=400)
+            locate_sym_qK(model, qk_symbol) === nothing && return error_response("Unknown qK symbol: $qk_symbol"; status=400)
+            push!(pairs, (x_symbol, qk_symbol))
+        end
+
+        add_inner_points = Bool(get(body, :add_inner_points, true))
+        npoints = clamp(Int(get(body, :npoints, 5000)), 0, 100000)
+        singular_extends = Float64(get(body, :singular_extends, 2.0))
+
+        rop_data = try
+            get_ROP_plot_data(
+                model,
+                pairs;
+                add_inner_points=add_inner_points,
+                npoints=npoints,
+                singular_extends=singular_extends,
+            )
+        catch e
+            return error_response("Failed to compute ROP geometry: $(sprint(showerror, e))"; status=500)
+        end
+
+        point_json = [
+            Dict(
+                "coords" => collect(point.coords),
+                "vertex_idx" => point.vertex_idx,
+                "perm" => point.perm,
+                "point_type" => String(point.point_type),
+            ) for point in rop_data.points
+        ]
+        pair_json = [
+            Dict(
+                "x_symbol" => pair.x_symbol,
+                "qk_symbol" => pair.qK_symbol,
+                "label" => pair.label,
+            ) for pair in rop_data.pairs
+        ]
+        edge_json(edges, include_to_idx::Bool=true) = [
+            include_to_idx ?
+            Dict(
+                "from" => collect(edge.from),
+                "to" => collect(edge.to),
+                "from_idx" => edge.from_idx,
+                "to_idx" => edge.to_idx,
+            ) :
+            Dict(
+                "from" => collect(edge.from),
+                "to" => collect(edge.to),
+                "from_idx" => edge.from_idx,
+                "singular_idx" => edge.singular_idx,
+            ) for edge in edges
+        ]
+
+        return json_response(Dict(
+            "dimension" => rop_data.dimension,
+            "pairs" => pair_json,
+            "axis_labels" => collect(rop_data.axis_labels),
+            "add_inner_points" => add_inner_points,
+            "npoints" => npoints,
+            "singular_extends" => singular_extends,
+            "points" => point_json,
+            "direct_edges" => edge_json(rop_data.direct_edges, true),
+            "indirect_edges" => edge_json(rop_data.indirect_edges, true),
+            "direct_rays" => edge_json(rop_data.direct_rays, false),
+            "indirect_rays" => edge_json(rop_data.indirect_rays, false),
+            "inner_points" => [collect(point) for point in rop_data.inner_points],
+        ))
+    end
+
+    haskey(body, :output_expr) || return error_response(
+        "ROP request must include either `pairs` for draw_ROP axes or legacy `output_expr` parameters";
+        status=400,
+    )
+
     # Parse output expression
     output_expr = String(body[:output_expr])
     output_coeffs = try
@@ -961,6 +1192,7 @@ const API_ROUTES = Dict{String, Function}(
     "/api/siso_paths" => handle_siso_paths,
     "/api/siso_polyhedra" => handle_siso_polyhedra,
     "/api/siso_trajectory" => handle_siso_trajectory,
+    "/api/behavior_families" => handle_behavior_families,
     "/api/rop_cloud" => handle_rop_cloud,
     "/api/vertex_detail" => handle_vertex_detail,
     "/api/fret_heatmap" => handle_fret_heatmap,
